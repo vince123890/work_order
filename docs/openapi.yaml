@@ -1,0 +1,5013 @@
+openapi: 3.1.0
+info:
+  title: 'VASTA Field Service API (Jalur B: Route Handler / RPC)'
+  version: 0.1.0-draft
+  summary: Kontrak endpoint logika kritis. Pembacaan dan CRUD sederhana lewat Supabase PostgREST+RLS tidak tercakup (lihat
+    03_api_design.md bagian 2).
+  description: |-
+    Draf kontrak yang konsisten dengan `03_api_design.md`. Semua angka operasional (batas laju, ukuran, kedaluwarsa, ukuran halaman) adalah parameter [P] dan sengaja tidak ditetapkan. Nama tabel/kolom/enum/RPC mengikuti `04_database_schema.sql` dan `05_rls_and_security.md` (acuan); celah yang belum ada di 04 ditandai G-nn di 03 bagian 10.2.
+
+    Cakupan: endpoint Lapis produk 1 dan 2 lengkap; Lapis 3 ringkas. Setiap operasi memuat ekstensi `x-roles`, `x-layer`, `x-transition`, `x-error-codes`.
+
+    Peran memakai enum app_role: CUSTOMER, ADMIN_CS, DISPATCHER, TECHNICIAN, SUPERVISOR, WAREHOUSE, FINANCE, OWNER; ditambah ANY (pengguna terautentikasi), PUBLIC, SYSTEM (job/webhook).
+  license:
+    name: Proprietary (portofolio)
+    identifier: LicenseRef-Portfolio
+servers:
+- url: https://{host}/api/v1
+  variables:
+    host:
+      default: localhost:3000
+      description: '[A] Host aplikasi Next.js.'
+tags:
+- name: akun
+  description: Akun, registrasi, undangan
+- name: permintaan
+  description: Permintaan servis dan unggahan
+- name: wo-transisi
+  description: 'Work order: transisi status (wo_transition) dan RPC kecil'
+- name: persetujuan
+  description: Persetujuan biaya tambahan
+- name: stok
+  description: Suku cadang dan stok
+- name: kontrak-pm
+  description: Pemeliharaan berkala
+- name: berkas
+  description: Berkas
+- name: sinkron
+  description: Sinkronisasi offline teknisi
+- name: internal
+  description: Endpoint internal (job, webhook)
+- name: lapis3
+  description: Lapis 3 (ringkas)
+security:
+- bearerAuth: []
+paths:
+  /auth/registrations:
+    post:
+      operationId: registerCustomer
+      summary: 'Mulai registrasi mandiri: captcha + OTP email'
+      tags:
+      - akun
+      description: |-
+        Selalu 202 agar keberadaan akun dan konfigurasi tidak bocor. Bila `registration.mode` NULL atau INVITE, tidak ada efek. Sesudah verifikasi OTP klien memanggil `POST /me/registration`. Hanya pelanggan perorangan (`register_individual_customer`); pelanggan korporat lewat undangan.
+
+        Peran (enum app_role): PUBLIC. Lapis produk: 1.
+
+        Backing database: Supabase Auth signInWithOtp (server).
+
+        Kode error domain: `CAPTCHA_FAILED` (422); `RATE_LIMITED` (429); `VALIDATION_FAILED` (422).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegistrationRequest'
+      responses:
+        '202':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security: []
+      x-roles:
+      - PUBLIC
+      x-db: Supabase Auth signInWithOtp (server)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - CAPTCHA_FAILED
+      - RATE_LIMITED
+      - VALIDATION_FAILED
+      x-rate-limit-policy: registration
+  /me/registration:
+    post:
+      operationId: completeRegistration
+      summary: Selesaikan registrasi pelanggan perorangan (customer + consent)
+      tags:
+      - akun
+      description: |-
+        Peran (enum app_role): ANY. Lapis produk: 1.
+
+        Backing database: rpc register_individual_customer(p_full_name, p_phone, p_policy_version).
+
+        Kode error domain: `REGISTRATION_DISABLED` (403); `VALIDATION_FAILED` (422); `INVALID_TRANSITION` (409).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteRegistrationRequest'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerRef'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ANY
+      x-db: rpc register_individual_customer(p_full_name, p_phone, p_policy_version)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - REGISTRATION_DISABLED
+      - VALIDATION_FAILED
+      - INVALID_TRANSITION
+  /me/invitations/accept:
+    post:
+      operationId: acceptInvitation
+      summary: Terima undangan pelanggan (token sekali pakai)
+      tags:
+      - akun
+      description: |-
+        Peran (enum app_role): ANY. Lapis produk: 1.
+
+        Backing database: rpc accept_customer_invitation(p_token, p_policy_version).
+
+        Kode error domain: `INVITATION_INVALID` (404); `VALIDATION_FAILED` (422); `INVALID_TRANSITION` (409).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AcceptInvitationRequest'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerRef'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ANY
+      x-db: rpc accept_customer_invitation(p_token, p_policy_version)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - INVITATION_INVALID
+      - VALIDATION_FAILED
+      - INVALID_TRANSITION
+  /me:
+    get:
+      operationId: getMe
+      summary: Profil, peran, keanggotaan pelanggan, dan technician_id pemanggil
+      tags:
+      - akun
+      description: |-
+        Hanya petunjuk UI. Otorisasi tidak pernah memakai respons ini (D01).
+
+        Peran (enum app_role): ANY. Lapis produk: 1.
+
+        Backing database: select profiles, user_roles, customer_users, technicians (JWT).
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ANY
+      x-db: select profiles, user_roles, customer_users, technicians (JWT)
+      x-layer: 1
+      x-jalur: B
+  /customers/{customerId}/invitations:
+    post:
+      operationId: inviteCustomerUser
+      summary: Buat undangan pelanggan dan kirim email
+      tags:
+      - akun
+      description: |-
+        Server membuat token acak, menyimpan hanya `token_hash`, mengirim tautan. Token tidak disimpan dan tidak dikembalikan.
+
+        Peran (enum app_role): ADMIN_CS. Lapis produk: 1.
+
+        Backing database: insert customer_invitations (token_hash) dengan JWT ADM + kirim email (server).
+
+        Kode error domain: `VALIDATION_FAILED` (422); `NOT_FOUND` (404).
+      parameters:
+      - name: customerId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvitationRequest'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invitation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      x-db: insert customer_invitations (token_hash) dengan JWT ADM + kirim email (server)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - VALIDATION_FAILED
+      - NOT_FOUND
+  /admin/staff-users:
+    post:
+      operationId: createStaffUser
+      summary: Buat pengguna staf lalu tetapkan peran
+      tags:
+      - akun
+      description: |-
+        Mengubah peran OWNER/ADMIN_CS hanya oleh OWNER (D22). CUSTOMER eksklusif terhadap peran staf. Baris `technicians` dibuat lewat Jalur A (ADM) bila perlu.
+
+        Peran (enum app_role): ADMIN_CS, OWNER. Lapis produk: 1.
+
+        Backing database: auth.admin.inviteUserByEmail (service role) + rpc admin_set_user_roles.
+
+        Kode error domain: `EMAIL_ALREADY_REGISTERED` (409); `FORBIDDEN_ROLE` (403); `VALIDATION_FAILED` (422).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StaffUserCreate'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StaffUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      - OWNER
+      x-db: auth.admin.inviteUserByEmail (service role) + rpc admin_set_user_roles
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - EMAIL_ALREADY_REGISTERED
+      - FORBIDDEN_ROLE
+      - VALIDATION_FAILED
+  /admin/staff-users/{userId}:
+    patch:
+      operationId: updateStaffUser
+      summary: Ubah peran dan/atau status aktif; sesi dicabut saat dinonaktifkan
+      tags:
+      - akun
+      description: |-
+        RLS menolak pengguna nonaktif seketika; signOut hanya mempercepat pembersihan token (FR-007).
+
+        Peran (enum app_role): ADMIN_CS, OWNER. Lapis produk: 1.
+
+        Backing database: rpc admin_set_user_roles / admin_set_user_active + auth.admin.signOut (service role).
+
+        Kode error domain: `FORBIDDEN_ROLE` (403); `VALIDATION_FAILED` (422).
+      parameters:
+      - name: userId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StaffUserPatch'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StaffUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      - OWNER
+      x-db: rpc admin_set_user_roles / admin_set_user_active + auth.admin.signOut (service role)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - FORBIDDEN_ROLE
+      - VALIDATION_FAILED
+  /uploads/sign:
+    post:
+      operationId: signUpload
+      summary: Minta signed upload URL untuk baris metadata yang sudah dibuat klien
+      tags:
+      - permintaan
+      description: |-
+        Urutan: (1) klien INSERT baris `request_attachments` / `wo_attachments` / `wo_signatures` lewat Jalur A (path `{customer_id}/req/{request_id}/...` atau `{customer_id}/wo/{wo_id}/...`, upload_status PENDING); (2) endpoint ini; (3) klien PUT ke URL; (4) `POST /uploads/complete`. Tidak ada policy INSERT di storage.objects (D19). Foto/tanda tangan teknisi: WO harus editable (`app.can_edit_wo`). Tanda tangan pelanggan via PWA: `resource=WO_SIGNATURE_PWA` dengan `wo_id` + `file_name` (tanpa metadata; baris dibuat `wo_customer_sign`).
+
+        Peran (enum app_role): CUSTOMER, ADMIN_CS, TECHNICIAN. Lapis produk: 1.
+
+        Backing database: baca baris metadata (JWT, RLS membuktikan hak) lalu createSignedUploadUrl (service role, 05 bagian 6a).
+
+        Kode error domain: `UPLOAD_TYPE_NOT_ALLOWED` (415); `UPLOAD_TOO_LARGE` (413); `UPLOAD_LIMIT_EXCEEDED` (422); `UPLOAD_PATH_INVALID` (422); `DATA_IMMUTABLE` (409); `RATE_LIMITED` (429); `NOT_FOUND` (404).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignUploadRequest'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadTarget'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - CUSTOMER
+      - ADMIN_CS
+      - TECHNICIAN
+      x-db: baca baris metadata (JWT, RLS membuktikan hak) lalu createSignedUploadUrl (service role, 05 bagian 6a)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - UPLOAD_TYPE_NOT_ALLOWED
+      - UPLOAD_TOO_LARGE
+      - UPLOAD_LIMIT_EXCEEDED
+      - UPLOAD_PATH_INVALID
+      - DATA_IMMUTABLE
+      - RATE_LIMITED
+      - NOT_FOUND
+      x-rate-limit-policy: upload
+  /uploads/complete:
+    post:
+      operationId: completeUpload
+      summary: 'Konfirmasi unggahan: server memverifikasi lalu menandai UPLOADED'
+      tags:
+      - permintaan
+      description: |-
+        Hanya server yang dapat mengubah `upload_status` (hak kolom dicabut dari klien, D19). Idempoten alami. `wo_signatures` tidak punya kolom upload_status (G-04).
+
+        Peran (enum app_role): CUSTOMER, ADMIN_CS, TECHNICIAN. Lapis produk: 1.
+
+        Backing database: service role: cek objek (ukuran, magic bytes, sha256) lalu update upload_status=UPLOADED.
+
+        Kode error domain: `UPLOAD_NOT_FOUND` (409); `CHECKSUM_MISMATCH` (422); `UPLOAD_TYPE_NOT_ALLOWED` (415); `NOT_FOUND` (404).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CompleteUploadRequest'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Attachment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - CUSTOMER
+      - ADMIN_CS
+      - TECHNICIAN
+      x-db: 'service role: cek objek (ukuran, magic bytes, sha256) lalu update upload_status=UPLOADED'
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - UPLOAD_NOT_FOUND
+      - CHECKSUM_MISMATCH
+      - UPLOAD_TYPE_NOT_ALLOWED
+      - NOT_FOUND
+  /service-requests/{requestId}/approve:
+    post:
+      operationId: approveServiceRequest
+      summary: Setujui permintaan dan buat WO (T-01)
+      tags:
+      - permintaan
+      description: |-
+        Satu transaksi: nomor WO `WO-YYYY-nnnnnn` (document_counters), billing_type (app.determine_billing), snapshot SLA, riwayat, audit, notifikasi `request.accepted`. Auto-approve kontrak (SP-02) berjalan sebagai SYSTEM_RULE di trigger, tanpa endpoint.
+
+        Peran (enum app_role): ADMIN_CS. Lapis produk: 1.
+
+        Backing database: rpc request_decide(p_request_id, 'APPROVE', p_priority_code, p_service_type_id, p_estimate_total, p_reason, p_expected_version).
+
+        Transisi/aturan: T-01 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `ASSET_REQUIRED` (422); `SERVICE_TYPE_REQUIRED` (422); `PRIORITY_REQUIRED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404); `FORBIDDEN_ROLE` (403).
+      parameters:
+      - name: requestId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApproveRequestBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApproveRequestResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      x-db: rpc request_decide(p_request_id, 'APPROVE', p_priority_code, p_service_type_id, p_estimate_total, p_reason, p_expected_version)
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-01
+      x-error-codes:
+      - ASSET_REQUIRED
+      - SERVICE_TYPE_REQUIRED
+      - PRIORITY_REQUIRED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+      - FORBIDDEN_ROLE
+  /service-requests/{requestId}/request-info:
+    post:
+      operationId: requestMoreInfo
+      summary: Minta info tambahan ke pelanggan (NEEDS_INFO)
+      tags:
+      - permintaan
+      description: |-
+        Peran (enum app_role): ADMIN_CS. Lapis produk: 1.
+
+        Backing database: rpc request_decide(..., 'NEEDS_INFO', p_reason := catatan).
+
+        Kode error domain: `REASON_REQUIRED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: requestId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonOnly'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecisionResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      x-db: rpc request_decide(..., 'NEEDS_INFO', p_reason := catatan)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - REASON_REQUIRED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /service-requests/{requestId}/reject:
+    post:
+      operationId: rejectServiceRequest
+      summary: Tolak permintaan dengan alasan (T-24)
+      tags:
+      - permintaan
+      description: |-
+        Peran (enum app_role): ADMIN_CS. Lapis produk: 1.
+
+        Backing database: rpc request_decide(..., 'REJECT', p_reason).
+
+        Transisi/aturan: T-24 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `REASON_REQUIRED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: requestId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonOnly'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DecisionResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      x-db: rpc request_decide(..., 'REJECT', p_reason)
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-24
+      x-error-codes:
+      - REASON_REQUIRED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/assign:
+    post:
+      operationId: assignWorkOrder
+      summary: Tugaskan teknisi + jadwal final
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): DISPATCHER. Lapis produk: 1.
+
+        Backing database: wo_transition('ASSIGN'; p_payload {technician_id, scheduled_start, scheduled_end, override_reason}).
+
+        Transisi/aturan: T-02 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `TECHNICIAN_INVALID` (422); `SCHEDULE_REQUIRED` (422); `SOFT_GUARD` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `FORBIDDEN_ROLE` (403); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AssignBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - DISPATCHER
+      x-db: wo_transition('ASSIGN'; p_payload {technician_id, scheduled_start, scheduled_end, override_reason})
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-02
+      x-error-codes:
+      - TECHNICIAN_INVALID
+      - SCHEDULE_REQUIRED
+      - SOFT_GUARD
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - FORBIDDEN_ROLE
+      - NOT_FOUND
+  /work-orders/{workOrderId}/reassign:
+    post:
+      operationId: reassignWorkOrder
+      summary: Tugas ulang ke teknisi lain (alasan wajib)
+      tags:
+      - wo-transisi
+      description: |-
+        Hanya sebelum check-in (ASSIGNED/ACCEPTED). Serah-terima mid-visit belum ada di 04 (G-12).
+
+        Peran (enum app_role): DISPATCHER. Lapis produk: 1.
+
+        Backing database: wo_transition('REASSIGN').
+
+        Transisi/aturan: T-05 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `TECHNICIAN_INVALID` (422); `SCHEDULE_REQUIRED` (422); `SOFT_GUARD` (422); `REASON_REQUIRED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReassignBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - DISPATCHER
+      x-db: wo_transition('REASSIGN')
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-05
+      x-error-codes:
+      - TECHNICIAN_INVALID
+      - SCHEDULE_REQUIRED
+      - SOFT_GUARD
+      - REASON_REQUIRED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/accept:
+    post:
+      operationId: acceptAssignment
+      summary: Teknisi menerima tugas
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 1.
+
+        Backing database: wo_transition('ACCEPT').
+
+        Transisi/aturan: T-03 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: ACCEPT.
+
+        Kode error domain: `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `FORBIDDEN_ROLE` (403); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClientCaptured'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: wo_transition('ACCEPT')
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-03
+      x-sync-op: ACCEPT
+      x-error-codes:
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - FORBIDDEN_ROLE
+      - NOT_FOUND
+  /work-orders/{workOrderId}/reject-assignment:
+    post:
+      operationId: rejectAssignment
+      summary: Teknisi menolak tugas (alasan wajib)
+      tags:
+      - wo-transisi
+      description: |-
+        reason_code dari reason_codes kategori REJECT_ASSIGNMENT.
+
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 1.
+
+        Backing database: wo_transition('REJECT').
+
+        Transisi/aturan: T-04 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: REJECT.
+
+        Kode error domain: `REASON_REQUIRED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: wo_transition('REJECT')
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-04
+      x-sync-op: REJECT
+      x-error-codes:
+      - REASON_REQUIRED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/release:
+    post:
+      operationId: releaseWorkOrder
+      summary: Lepas tugas yang sudah diterima (sebelum check-in)
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): TECHNICIAN, DISPATCHER. Lapis produk: 1.
+
+        Backing database: wo_transition('RELEASE').
+
+        Transisi/aturan: T-06 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: RELEASE.
+
+        Kode error domain: `REASON_REQUIRED` (422); `ALREADY_CHECKED_IN` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      - DISPATCHER
+      x-db: wo_transition('RELEASE')
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-06
+      x-sync-op: RELEASE
+      x-error-codes:
+      - REASON_REQUIRED
+      - ALREADY_CHECKED_IN
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/depart:
+    post:
+      operationId: departToSite
+      summary: Berangkat menuju lokasi
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 1.
+
+        Backing database: wo_transition('DEPART').
+
+        Transisi/aturan: T-07 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: DEPART.
+
+        Kode error domain: `NOT_SCHEDULED_TODAY` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClientCaptured'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: wo_transition('DEPART')
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-07
+      x-sync-op: DEPART
+      x-error-codes:
+      - NOT_SCHEDULED_TODAY
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/check-in:
+    post:
+      operationId: checkIn
+      summary: Check-in di lokasi (GPS atas izin; bukan pelacakan kontinu)
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 1.
+
+        Backing database: wo_transition('CHECK_IN'; payload {lat, lng, accuracy_m, no_gps_reason, client_ts}).
+
+        Transisi/aturan: T-08 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: CHECK_IN.
+
+        Kode error domain: `GPS_OR_REASON_REQUIRED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckInBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: wo_transition('CHECK_IN'; payload {lat, lng, accuracy_m, no_gps_reason, client_ts})
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-08
+      x-sync-op: CHECK_IN
+      x-error-codes:
+      - GPS_OR_REASON_REQUIRED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/hold-parts:
+    post:
+      operationId: holdForParts
+      summary: Tunda menunggu suku cadang
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 2.
+
+        Backing database: wo_transition('HOLD_PARTS').
+
+        Transisi/aturan: T-09 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: HOLD_PARTS.
+
+        Kode error domain: `NO_OPEN_PART_REQUEST` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmptyBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: wo_transition('HOLD_PARTS')
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-09
+      x-sync-op: HOLD_PARTS
+      x-error-codes:
+      - NO_OPEN_PART_REQUEST
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/resume-parts:
+    post:
+      operationId: resumeFromHold
+      summary: Lanjutkan setelah suku cadang tiba/dibatalkan
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): TECHNICIAN, DISPATCHER. Lapis produk: 2.
+
+        Backing database: wo_transition('RESUME_PARTS').
+
+        Transisi/aturan: T-10 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: RESUME_PARTS.
+
+        Kode error domain: `PART_REQUEST_OPEN` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmptyBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      - DISPATCHER
+      x-db: wo_transition('RESUME_PARTS')
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-10
+      x-sync-op: RESUME_PARTS
+      x-error-codes:
+      - PART_REQUEST_OPEN
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/request-signoff:
+    post:
+      operationId: requestSignoff
+      summary: Minta pelanggan menandatangani lewat PWA (AWAITING_SIGNOFF)
+      tags:
+      - wo-transisi
+      description: |-
+        Semua syarat BR-040 kecuali tanda tangan harus terpenuhi (mode SIGNOFF_REQUEST).
+
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 2.
+
+        Backing database: wo_transition('REQUEST_SIGNOFF').
+
+        Transisi/aturan: T-17 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: REQUEST_SIGNOFF.
+
+        Kode error domain: `CLOSURE_REQUIREMENTS_NOT_MET` (422); `EXCEPTION_NOTE_REQUIRED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: wo_transition('REQUEST_SIGNOFF')
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-17
+      x-sync-op: REQUEST_SIGNOFF
+      x-error-codes:
+      - CLOSURE_REQUIREMENTS_NOT_MET
+      - EXCEPTION_NOTE_REQUIRED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/signoff:
+    post:
+      operationId: customerSignoff
+      summary: Pelanggan menandatangani penerimaan hasil kerja di PWA (T-18)
+      tags:
+      - wo-transisi
+      description: |-
+        Gambar tanda tangan diunggah lebih dulu lewat /uploads/sign ke path `{customer_id}/wo/{wo_id}/...`. `content_hash` diisi server (D12); klien tidak dapat menyuplainya.
+
+        Peran (enum app_role): CUSTOMER. Lapis produk: 2.
+
+        Backing database: rpc wo_customer_sign(p_wo_id, p_signer_name, p_storage_path, p_expected_version, p_op_id, p_device_meta).
+
+        Transisi/aturan: T-18 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `INVALID_TRANSITION` (409); `CLOSURE_REQUIREMENTS_NOT_MET` (422); `VERSION_CONFLICT` (409); `NOT_FOUND` (404); `VALIDATION_FAILED` (422).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SignoffBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - CUSTOMER
+      x-db: rpc wo_customer_sign(p_wo_id, p_signer_name, p_storage_path, p_expected_version, p_op_id, p_device_meta)
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-18
+      x-error-codes:
+      - INVALID_TRANSITION
+      - CLOSURE_REQUIREMENTS_NOT_MET
+      - VERSION_CONFLICT
+      - NOT_FOUND
+      - VALIDATION_FAILED
+  /work-orders/{workOrderId}/submit:
+    post:
+      operationId: submitWorkOrder
+      summary: 'Tutup oleh teknisi: check-out dan kirim ke review (T-16), atau tutup tidak tuntas (T-14)'
+      tags:
+      - wo-transisi
+      description: |-
+        Server memilih aksi dari status WO. Payload: closure_exception_code/closure_exception_note (BR-041), outcome, lat/lng check-out, client_pending_ops (harus 0, BR-040 butir 8). Di database T-19 hanya oleh SUPERVISOR; tidak ada penutupan otomatis (G-01).
+
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 1.
+
+        Backing database: wo_transition('SUBMIT_REVIEW') dari IN_PROGRESS; ('CLOSE_AFTER_REJECTION') dari AWAITING_CUSTOMER_APPROVAL (T-14: outcome PARTIAL/UNRESOLVED + alasan).
+
+        Transisi/aturan: T-16 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: SUBMIT_REVIEW.
+
+        Kode error domain: `CLOSURE_REQUIREMENTS_NOT_MET` (422); `EXCEPTION_NOTE_REQUIRED` (422); `NO_BLOCKING_REJECTION` (422); `OUTCOME_INVALID` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404); `VALIDATION_FAILED` (422).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SubmitBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: 'wo_transition(''SUBMIT_REVIEW'') dari IN_PROGRESS; (''CLOSE_AFTER_REJECTION'') dari AWAITING_CUSTOMER_APPROVAL
+        (T-14: outcome PARTIAL/UNRESOLVED + alasan)'
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-16
+      x-sync-op: SUBMIT_REVIEW
+      x-error-codes:
+      - CLOSURE_REQUIREMENTS_NOT_MET
+      - EXCEPTION_NOTE_REQUIRED
+      - NO_BLOCKING_REJECTION
+      - OUTCOME_INVALID
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+      - VALIDATION_FAILED
+  /work-orders/{workOrderId}/review/approve:
+    post:
+      operationId: approveReview
+      summary: Supervisor menyetujui dan menutup WO (T-19)
+      tags:
+      - wo-transisi
+      description: |-
+        Memvalidasi ulang BR-040 (mode CLOSE, BR-042). Efek: closed_at, billing_status, `service_reports` revisi baru status GENERATING (PDF dirender worker), penugasan COMPLETED, pm_periods COMPLETED, notifikasi `wo.closed`.
+
+        Peran (enum app_role): SUPERVISOR. Lapis produk: 2.
+
+        Backing database: wo_transition('APPROVE_CLOSE'; payload {approve_exception}).
+
+        Transisi/aturan: T-19 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `CLOSURE_REQUIREMENTS_NOT_MET` (422); `CLOSURE_EXCEPTION_NOT_APPROVED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `FORBIDDEN_ROLE` (403); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewApproveBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - SUPERVISOR
+      x-db: wo_transition('APPROVE_CLOSE'; payload {approve_exception})
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-19
+      x-error-codes:
+      - CLOSURE_REQUIREMENTS_NOT_MET
+      - CLOSURE_EXCEPTION_NOT_APPROVED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - FORBIDDEN_ROLE
+      - NOT_FOUND
+  /work-orders/{workOrderId}/review/return:
+    post:
+      operationId: returnReview
+      summary: Supervisor mengembalikan ke teknisi dengan catatan (T-20)
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): SUPERVISOR. Lapis produk: 2.
+
+        Backing database: wo_transition('RETURN').
+
+        Transisi/aturan: T-20 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `REASON_REQUIRED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `FORBIDDEN_ROLE` (403); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - SUPERVISOR
+      x-db: wo_transition('RETURN')
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-20
+      x-error-codes:
+      - REASON_REQUIRED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - FORBIDDEN_ROLE
+      - NOT_FOUND
+  /work-orders/{workOrderId}/resume-after-return:
+    post:
+      operationId: resumeAfterReturn
+      summary: Teknisi mulai memperbaiki WO yang dikembalikan (T-21)
+      tags:
+      - wo-transisi
+      description: |-
+        Tanda tangan lama menjadi SUPERSEDED saat pengajuan ulang bila content_hash berubah (BR-043).
+
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 2.
+
+        Backing database: wo_transition('RESUME_AFTER_RETURN').
+
+        Transisi/aturan: T-21 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: RESUME_AFTER_RETURN.
+
+        Kode error domain: `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ClientCaptured'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: wo_transition('RESUME_AFTER_RETURN')
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-21
+      x-sync-op: RESUME_AFTER_RETURN
+      x-error-codes:
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/cancel:
+    post:
+      operationId: cancelWorkOrder
+      summary: Batalkan WO (alasan wajib)
+      tags:
+      - wo-transisi
+      description: |-
+        Server memilih aksi dari status. reason_code dari kategori CANCEL. Stok yang sudah diserahkan menjadi selisih sampai dikembalikan (BR-037).
+
+        Peran (enum app_role): ADMIN_CS, DISPATCHER, SUPERVISOR. Lapis produk: 1.
+
+        Backing database: wo_transition('CANCEL') untuk NEW..EN_ROUTE (ADM/DSP); ('CANCEL_ACTIVE') untuk IN_PROGRESS/ON_HOLD_PARTS/AWAITING_* (hanya SPV, T-23).
+
+        Transisi/aturan: T-22 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `REASON_REQUIRED` (422); `FORBIDDEN_ROLE` (403); `DATA_IMMUTABLE` (409); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      - DISPATCHER
+      - SUPERVISOR
+      x-db: wo_transition('CANCEL') untuk NEW..EN_ROUTE (ADM/DSP); ('CANCEL_ACTIVE') untuk IN_PROGRESS/ON_HOLD_PARTS/AWAITING_*
+        (hanya SPV, T-23)
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-22
+      x-error-codes:
+      - REASON_REQUIRED
+      - FORBIDDEN_ROLE
+      - DATA_IMMUTABLE
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/cancel-requests:
+    post:
+      operationId: customerCancelOrRequestCancel
+      summary: Pelanggan membatalkan (status NEW) atau mengajukan pembatalan (DEC-04)
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): CUSTOMER. Lapis produk: 1.
+
+        Backing database: status NEW: wo_transition('CANCEL_BY_CUSTOMER'); ASSIGNED/ACCEPTED/EN_ROUTE: rpc wo_request_cancel(p_wo_id, p_note) (hanya mencatat; keputusan ADM/DSP).
+
+        Transisi/aturan: T-22 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `INVALID_TRANSITION` (409); `NOT_FOUND` (404); `REASON_REQUIRED` (422).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReasonBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelRequestResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - CUSTOMER
+      x-db: 'status NEW: wo_transition(''CANCEL_BY_CUSTOMER''); ASSIGNED/ACCEPTED/EN_ROUTE: rpc wo_request_cancel(p_wo_id,
+        p_note) (hanya mencatat; keputusan ADM/DSP)'
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-22
+      x-error-codes:
+      - INVALID_TRANSITION
+      - NOT_FOUND
+      - REASON_REQUIRED
+  /work-orders/{workOrderId}/help-requests:
+    post:
+      operationId: requestHelp
+      summary: Minta bantuan (flag help_requested_at; status tidak berubah, T-26)
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 1.
+
+        Backing database: rpc wo_request_help(p_wo_id, p_note).
+
+        Transisi/aturan: T-26 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: HELP_REQUEST.
+
+        Kode error domain: `DATA_IMMUTABLE` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NoteBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: rpc wo_request_help(p_wo_id, p_note)
+      x-layer: 1
+      x-jalur: B
+      x-transition: T-26
+      x-sync-op: HELP_REQUEST
+      x-error-codes:
+      - DATA_IMMUTABLE
+      - NOT_FOUND
+  /work-orders/{workOrderId}/helpers:
+    post:
+      operationId: addHelper
+      summary: Tambah teknisi pendamping (langsung ACCEPTED, D28)
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): DISPATCHER. Lapis produk: 1.
+
+        Backing database: rpc wo_add_helper(p_wo_id, p_technician_id).
+
+        Kode error domain: `TECHNICIAN_INVALID` (422); `INVALID_TRANSITION` (409); `FORBIDDEN_ROLE` (403).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddHelperBody'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - DISPATCHER
+      x-db: rpc wo_add_helper(p_wo_id, p_technician_id)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - TECHNICIAN_INVALID
+      - INVALID_TRANSITION
+      - FORBIDDEN_ROLE
+  /work-orders/{workOrderId}/failed-visit:
+    post:
+      operationId: reportFailedVisit
+      summary: 'Kunjungan gagal: WO kembali ke NEW (T-27)'
+      tags:
+      - wo-transisi
+      description: |-
+        Wajib satu foto `wo_attachments.kind = FAILED_VISIT` (D11). Penugasan menjadi RELEASED, failed_visit_count bertambah.
+
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 2.
+
+        Backing database: wo_transition('VISIT_FAILED').
+
+        Transisi/aturan: T-27 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: VISIT_FAILED.
+
+        Kode error domain: `FAILED_VISIT_EVIDENCE_MISSING` (422); `REASON_REQUIRED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatchOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/FailedVisitBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: wo_transition('VISIT_FAILED')
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-27
+      x-sync-op: VISIT_FAILED
+      x-error-codes:
+      - FAILED_VISIT_EVIDENCE_MISSING
+      - REASON_REQUIRED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /work-orders/{workOrderId}/priority:
+    post:
+      operationId: changeWorkOrderPriority
+      summary: Ubah prioritas (SLA dihitung ulang dari sla_clock_start_at, BR-015)
+      tags:
+      - wo-transisi
+      description: |-
+        Menulis baris wo_status_history action CHANGE_PRIORITY. Respons memakai bentuk TransitionResult dengan from_status = to_status.
+
+        Peran (enum app_role): ADMIN_CS, DISPATCHER, SUPERVISOR. Lapis produk: 1.
+
+        Backing database: rpc wo_change_priority(p_wo_id, p_priority_code, p_reason, p_expected_version).
+
+        Kode error domain: `REASON_REQUIRED` (422); `DATA_IMMUTABLE` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404); `FORBIDDEN_ROLE` (403).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PriorityBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      - DISPATCHER
+      - SUPERVISOR
+      x-db: rpc wo_change_priority(p_wo_id, p_priority_code, p_reason, p_expected_version)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - REASON_REQUIRED
+      - DATA_IMMUTABLE
+      - VERSION_CONFLICT
+      - NOT_FOUND
+      - FORBIDDEN_ROLE
+  /work-orders/{workOrderId}/estimate:
+    post:
+      operationId: setWorkOrderEstimate
+      summary: Tetapkan estimasi awal (acuan BR-050)
+      tags:
+      - wo-transisi
+      description: |-
+        Peran (enum app_role): ADMIN_CS, SUPERVISOR. Lapis produk: 2.
+
+        Backing database: rpc wo_set_estimate(p_wo_id, p_estimate, p_expected_version).
+
+        Kode error domain: `DATA_IMMUTABLE` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404); `FORBIDDEN_ROLE` (403).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EstimateBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      - SUPERVISOR
+      x-db: rpc wo_set_estimate(p_wo_id, p_estimate, p_expected_version)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - DATA_IMMUTABLE
+      - VERSION_CONFLICT
+      - NOT_FOUND
+      - FORBIDDEN_ROLE
+  /work-orders/{workOrderId}/billing-override:
+    post:
+      operationId: overrideBilling
+      summary: Ubah billing_type dengan alasan (BR-062)
+      tags:
+      - wo-transisi
+      description: |-
+        Ditolak (WO001) setelah INVOICED/PAID.
+
+        Peran (enum app_role): SUPERVISOR. Lapis produk: 2.
+
+        Backing database: rpc wo_override_billing(p_wo_id, p_billing_type, p_reason).
+
+        Kode error domain: `REASON_REQUIRED` (422); `INVALID_TRANSITION` (409); `FORBIDDEN_ROLE` (403); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingOverrideBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - SUPERVISOR
+      x-db: rpc wo_override_billing(p_wo_id, p_billing_type, p_reason)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - REASON_REQUIRED
+      - INVALID_TRANSITION
+      - FORBIDDEN_ROLE
+      - NOT_FOUND
+  /work-orders/{workOrderId}/rework:
+    post:
+      operationId: createRework
+      summary: Buat WO REWORK dari WO CLOSED (T-25); induk tidak dibuka kembali
+      tags:
+      - wo-transisi
+      description: |-
+        Pelanggan hanya menulis baris `complaints` (Jalur A). billing_type default WARRANTY_WORK (BR-066). Di luar jendela `rework.claim_window_days` ditolak WO001.
+
+        Peran (enum app_role): ADMIN_CS, SUPERVISOR. Lapis produk: 2.
+
+        Backing database: rpc wo_create_rework(p_parent_wo_id, p_reason, p_priority_code, p_complaint_id).
+
+        Transisi/aturan: T-25 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `INVALID_TRANSITION` (409); `FORBIDDEN_ROLE` (403); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReworkBody'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      - SUPERVISOR
+      x-db: rpc wo_create_rework(p_parent_wo_id, p_reason, p_priority_code, p_complaint_id)
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-25
+      x-error-codes:
+      - INVALID_TRANSITION
+      - FORBIDDEN_ROLE
+      - NOT_FOUND
+  /work-orders/{workOrderId}/cost-summary:
+    get:
+      operationId: getCostSummary
+      summary: Ringkasan estimasi vs proyeksi dan needs_approval (BR-050)
+      tags:
+      - wo-transisi
+      description: |-
+        RPC juga dapat dipanggil TEK untuk WO aktifnya dan mengembalikan angka rupiah; UI teknisi tidak boleh menampilkannya (AP-2), lihat G-08.
+
+        Peran (enum app_role): ADMIN_CS, DISPATCHER, SUPERVISOR, FINANCE, OWNER, TECHNICIAN. Lapis produk: 2.
+
+        Backing database: rpc wo_cost_summary(p_wo_id).
+
+        Kode error domain: `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CostSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      - DISPATCHER
+      - SUPERVISOR
+      - FINANCE
+      - OWNER
+      - TECHNICIAN
+      x-db: rpc wo_cost_summary(p_wo_id)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - NOT_FOUND
+  /work-orders/{workOrderId}/extra-cost-approvals:
+    post:
+      operationId: requestExtraCost
+      summary: Ajukan biaya tambahan; WO masuk AWAITING_CUSTOMER_APPROVAL (T-11)
+      tags:
+      - persetujuan
+      description: |-
+        Item LABOR/PART dengan ref_id: harga dari master (service_items/items), bukan dari klien. Item OTHER memakai unit_price yang dikirim. Versi baru men-SUPERSEDE yang PENDING (BR-051); content_hash dihitung server. Dapat dipanggil lagi saat sudah AWAITING (revisi pengajuan). Respons memuat total; UI teknisi tidak menampilkannya (G-08).
+
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 2.
+
+        Backing database: rpc extra_cost_request(p_wo_id, p_reason, p_items, p_expected_version, p_op_id).
+
+        Transisi/aturan: T-11 (dokumen 02 bagian 4.4).
+
+        Operasi sinkron setara: REQUEST_EXTRA_COST.
+
+        Kode error domain: `VALIDATION_FAILED` (422); `INVALID_TRANSITION` (409); `VERSION_CONFLICT` (409); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtraCostRequest'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExtraCostRequestResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '428':
+          $ref: '#/components/responses/PreconditionRequired'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: rpc extra_cost_request(p_wo_id, p_reason, p_items, p_expected_version, p_op_id)
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-11
+      x-sync-op: REQUEST_EXTRA_COST
+      x-error-codes:
+      - VALIDATION_FAILED
+      - INVALID_TRANSITION
+      - VERSION_CONFLICT
+      - NOT_FOUND
+  /extra-cost-approvals/{approvalId}/decision:
+    post:
+      operationId: decideExtraCost
+      summary: Setujui atau tolak biaya tambahan (satu-satunya pintu keputusan; T-12/T-13/T-14)
+      tags:
+      - persetujuan
+      description: |-
+        APPROVE: T-12. REJECT + continue_original_scope=true: T-13 (IN_PROGRESS). REJECT + continue_original_scope=false: WO tetap AWAITING_CUSTOMER_APPROVAL sampai teknisi memanggil submit (T-14). ADM atas nama pelanggan: channel bukan PWA dan evidence_note wajib. p_meta diisi server (IP, user agent).
+
+        Peran (enum app_role): CUSTOMER, ADMIN_CS. Lapis produk: 2.
+
+        Backing database: rpc extra_cost_decide(p_approval_id, p_decision, p_content_hash, p_continue_original_scope, p_channel, p_evidence_note, p_op_id, p_meta).
+
+        Transisi/aturan: T-12 (dokumen 02 bagian 4.4).
+
+        Kode error domain: `APPROVAL_VERSION_STALE` (409); `APPROVAL_STALE` (409); `APPROVAL_EXPIRED` (409); `ON_BEHALF_EVIDENCE_REQUIRED` (422); `VALIDATION_FAILED` (422); `NOT_FOUND` (404).
+      parameters:
+      - name: approvalId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExtraCostDecision'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransitionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - CUSTOMER
+      - ADMIN_CS
+      x-db: rpc extra_cost_decide(p_approval_id, p_decision, p_content_hash, p_continue_original_scope, p_channel, p_evidence_note,
+        p_op_id, p_meta)
+      x-layer: 2
+      x-jalur: B
+      x-transition: T-12
+      x-error-codes:
+      - APPROVAL_VERSION_STALE
+      - APPROVAL_STALE
+      - APPROVAL_EXPIRED
+      - ON_BEHALF_EVIDENCE_REQUIRED
+      - VALIDATION_FAILED
+      - NOT_FOUND
+  /work-orders/{workOrderId}/part-requests:
+    post:
+      operationId: createPartRequest
+      summary: Minta suku cadang untuk WO
+      tags:
+      - stok
+      description: |-
+        Peran (enum app_role): TECHNICIAN, DISPATCHER. Lapis produk: 2.
+
+        Backing database: rpc part_request_create(p_wo_id, p_lines [{item_id, qty}], p_note).
+
+        Operasi sinkron setara: CREATE_PART_REQUEST.
+
+        Kode error domain: `DATA_IMMUTABLE` (409); `VALIDATION_FAILED` (422); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PartRequestCreate'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      - DISPATCHER
+      x-db: rpc part_request_create(p_wo_id, p_lines [{item_id, qty}], p_note)
+      x-layer: 2
+      x-jalur: B
+      x-sync-op: CREATE_PART_REQUEST
+      x-error-codes:
+      - DATA_IMMUTABLE
+      - VALIDATION_FAILED
+      - NOT_FOUND
+  /part-requests/{partRequestId}/decision:
+    post:
+      operationId: decidePartRequest
+      summary: Setujui atau tolak permintaan suku cadang
+      tags:
+      - stok
+      description: |-
+        Peran (enum app_role): WAREHOUSE. Lapis produk: 2.
+
+        Backing database: rpc part_request_decide(p_request_id, 'APPROVE'|'REJECT', p_note).
+
+        Kode error domain: `INVALID_TRANSITION` (409); `FORBIDDEN_ROLE` (403).
+      parameters:
+      - name: partRequestId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DecisionBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - WAREHOUSE
+      x-db: rpc part_request_decide(p_request_id, 'APPROVE'|'REJECT', p_note)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - INVALID_TRANSITION
+      - FORBIDDEN_ROLE
+  /part-request-lines/{lineId}/issue:
+    post:
+      operationId: issuePartLine
+      summary: Serahkan satu baris ke teknisi (ISSUE_TO_TECH); boleh sebagian
+      tags:
+      - stok
+      description: |-
+        Per baris, bukan per permintaan; tiap pemanggilan atomik. qty tidak boleh melebihi sisa permintaan (WO006).
+
+        Peran (enum app_role): WAREHOUSE. Lapis produk: 2.
+
+        Backing database: rpc part_issue(p_line_id, p_qty, p_from_location_id).
+
+        Kode error domain: `INSUFFICIENT_STOCK` (409); `INVALID_TRANSITION` (409); `VALIDATION_FAILED` (422); `FORBIDDEN_ROLE` (403).
+      parameters:
+      - name: lineId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IssueBody'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - WAREHOUSE
+      x-db: rpc part_issue(p_line_id, p_qty, p_from_location_id)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - INSUFFICIENT_STOCK
+      - INVALID_TRANSITION
+      - VALIDATION_FAILED
+      - FORBIDDEN_ROLE
+  /work-orders/{workOrderId}/part-returns:
+    post:
+      operationId: createPartReturn
+      summary: Ajukan pengembalian sisa (PENDING)
+      tags:
+      - stok
+      description: |-
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 2.
+
+        Backing database: rpc part_return_create(p_wo_id, p_lines [{item_id, qty}], p_note).
+
+        Operasi sinkron setara: CREATE_PART_RETURN.
+
+        Kode error domain: `DATA_IMMUTABLE` (409); `VALIDATION_FAILED` (422); `NOT_FOUND` (404).
+      parameters:
+      - name: workOrderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PartReturnCreate'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: rpc part_return_create(p_wo_id, p_lines [{item_id, qty}], p_note)
+      x-layer: 2
+      x-jalur: B
+      x-sync-op: CREATE_PART_RETURN
+      x-error-codes:
+      - DATA_IMMUTABLE
+      - VALIDATION_FAILED
+      - NOT_FOUND
+  /part-returns/{returnId}/confirm:
+    post:
+      operationId: confirmPartReturn
+      summary: Konfirmasi fisik (RETURN_FROM_TECH) atau tolak
+      tags:
+      - stok
+      description: |-
+        Stok gudang baru bertambah setelah konfirmasi (BR-034). Selisih dihitung ulang (BR-031/032).
+
+        Peran (enum app_role): WAREHOUSE. Lapis produk: 2.
+
+        Backing database: rpc part_return_confirm(p_return_id, p_lines [{item_id, confirmed_qty}], p_to_location_id, p_reject).
+
+        Kode error domain: `INVALID_TRANSITION` (409); `VALIDATION_FAILED` (422); `FORBIDDEN_ROLE` (403).
+      parameters:
+      - name: returnId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PartReturnConfirm'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - WAREHOUSE
+      x-db: rpc part_return_confirm(p_return_id, p_lines [{item_id, confirmed_qty}], p_to_location_id, p_reject)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - INVALID_TRANSITION
+      - VALIDATION_FAILED
+      - FORBIDDEN_ROLE
+  /stock/receipts:
+    post:
+      operationId: receiveStock
+      summary: Penerimaan barang (RECEIPT)
+      tags:
+      - stok
+      description: |-
+        Peran (enum app_role): WAREHOUSE. Lapis produk: 2.
+
+        Backing database: rpc stock_receive(p_item_id, p_location_id, p_qty, p_note).
+
+        Kode error domain: `VALIDATION_FAILED` (422); `FORBIDDEN_ROLE` (403).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StockReceiptBody'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - WAREHOUSE
+      x-db: rpc stock_receive(p_item_id, p_location_id, p_qty, p_note)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - VALIDATION_FAILED
+      - FORBIDDEN_ROLE
+  /stock/adjustments:
+    post:
+      operationId: adjustStock
+      summary: Penyesuaian/opname (ADJUSTMENT); di atas ambang hanya SPV
+      tags:
+      - stok
+      description: |-
+        Tidak ada alur persetujuan dua langkah di 04: ambang `stock.adjustment_supervisor_threshold` dicek langsung (WO002 bila GDG melebihinya). Lihat G-09.
+
+        Peran (enum app_role): WAREHOUSE, SUPERVISOR. Lapis produk: 2.
+
+        Backing database: rpc stock_adjust(p_item_id, p_location_id, p_delta, p_reason).
+
+        Kode error domain: `INSUFFICIENT_STOCK` (409); `VALIDATION_FAILED` (422); `FORBIDDEN_ROLE` (403).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/StockAdjustBody'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - WAREHOUSE
+      - SUPERVISOR
+      x-db: rpc stock_adjust(p_item_id, p_location_id, p_delta, p_reason)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - INSUFFICIENT_STOCK
+      - VALIDATION_FAILED
+      - FORBIDDEN_ROLE
+  /parts-variances/{varianceId}/resolve:
+    post:
+      operationId: resolveVariance
+      summary: Selesaikan selisih (mutasi koreksi, BR-033)
+      tags:
+      - stok
+      description: |-
+        GDG/SPV: EXPLAINED, RETURNED_LATE. Hanya SPV: WRITTEN_OFF, CHARGED_TO_CUSTOMER (belum melewati persetujuan biaya otomatis; TODO di 04).
+
+        Peran (enum app_role): WAREHOUSE, SUPERVISOR. Lapis produk: 2.
+
+        Backing database: rpc parts_variance_resolve(p_variance_id, p_status, p_note).
+
+        Kode error domain: `REASON_REQUIRED` (422); `FORBIDDEN_ROLE` (403); `INVALID_TRANSITION` (409); `VALIDATION_FAILED` (422).
+      parameters:
+      - name: varianceId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VarianceResolve'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - WAREHOUSE
+      - SUPERVISOR
+      x-db: rpc parts_variance_resolve(p_variance_id, p_status, p_note)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - REASON_REQUIRED
+      - FORBIDDEN_ROLE
+      - INVALID_TRANSITION
+      - VALIDATION_FAILED
+  /pm-periods/{periodId}/resolve:
+    post:
+      operationId: resolvePmPeriod
+      summary: 'Periode PM MISSED: buat WO sekarang atau lewati (BR-025)'
+      tags:
+      - kontrak-pm
+      description: |-
+        Generator otomatis (BR-022) tidak punya endpoint: job `pm_generate` memanggil `app.generate_preventive_work_orders`.
+
+        Peran (enum app_role): ADMIN_CS. Lapis produk: 2.
+
+        Backing database: rpc pm_period_resolve(p_period_id, 'SKIP'|'CREATE_NOW', p_reason).
+
+        Kode error domain: `REASON_REQUIRED` (422); `INVALID_TRANSITION` (409); `FORBIDDEN_ROLE` (403); `VALIDATION_FAILED` (422).
+      parameters:
+      - name: periodId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PmResolveBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PmResolveResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      x-db: rpc pm_period_resolve(p_period_id, 'SKIP'|'CREATE_NOW', p_reason)
+      x-layer: 2
+      x-jalur: B
+      x-error-codes:
+      - REASON_REQUIRED
+      - INVALID_TRANSITION
+      - FORBIDDEN_ROLE
+      - VALIDATION_FAILED
+  /files/download-urls:
+    post:
+      operationId: createDownloadUrls
+      summary: Signed URL unduh berumur pendek; akses staf ke data pelanggan dicatat
+      tags:
+      - berkas
+      description: |-
+        Pelanggan hanya mendapat objek terdaftar yang boleh dilihat: lampiran sendiri, foto BEFORE/AFTER/FINDING UPLOADED pada WO CLOSED, tanda tangan VALID, laporan READY. Selainnya NOT_FOUND tanpa membedakan.
+
+        Peran (enum app_role): ANY. Lapis produk: 1.
+
+        Backing database: app.can_read_object (policy storage) via createSignedUrl dengan JWT pengguna, atau service role setelah pemeriksaan; rpc log_data_access(p_customer_id, p_resource_type, p_resource_id, p_action) untuk staf.
+
+        Kode error domain: `NOT_FOUND` (404); `RATE_LIMITED` (429).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DownloadUrlsRequest'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DownloadUrls'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ANY
+      x-db: app.can_read_object (policy storage) via createSignedUrl dengan JWT pengguna, atau service role setelah pemeriksaan;
+        rpc log_data_access(p_customer_id, p_resource_type, p_resource_id, p_action) untuk staf
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - NOT_FOUND
+      - RATE_LIMITED
+      x-rate-limit-policy: download_urls
+  /sync/push:
+    post:
+      operationId: pushSync
+      summary: Kirim batch operasi outbox (idempoten per op_id, sukses parsial)
+      tags:
+      - sinkron
+      description: |-
+        HTTP 200 selama amplop sah; hasil per operasi di results[]. Kode per operasi (results[].code): CONFLICT_CANCELLED, CONFLICT_REASSIGNED, SEQ_GAP, serta kode domain dari eksekusi (mis. CLOSURE_REQUIREMENTS_NOT_MET, INSUFFICIENT_STOCK).
+
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 1.
+
+        Backing database: insert sync_operations (JWT, hak kolom sempit); terapkan via wo_transition / RPC / tulis tabel lapangan (JWT); update status+result sync_operations oleh service role (G-06).
+
+        Kode error domain: `APP_UPDATE_REQUIRED` (426); `PAYLOAD_TOO_LARGE` (413); `RATE_LIMITED` (429); `VALIDATION_FAILED` (422).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SyncPushRequest'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncPushResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: insert sync_operations (JWT, hak kolom sempit); terapkan via wo_transition / RPC / tulis tabel lapangan (JWT);
+        update status+result sync_operations oleh service role (G-06)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - APP_UPDATE_REQUIRED
+      - PAYLOAD_TOO_LARGE
+      - RATE_LIMITED
+      - VALIDATION_FAILED
+      x-rate-limit-policy: sync
+  /sync/pull:
+    get:
+      operationId: pullSync
+      summary: Ambil perubahan server (snapshot bila tanpa cursor) dan himpunan WO aktif
+      tags:
+      - sinkron
+      description: |-
+        Peran (enum app_role): TECHNICIAN. Lapis produk: 1.
+
+        Backing database: select view tech_*, work_orders, anak WO (JWT, RLS my_active_wo_ids) memakai updated_at; tidak ada sync_changes (G-05).
+
+        Kode error domain: `RATE_LIMITED` (429); `APP_UPDATE_REQUIRED` (426).
+      parameters:
+      - $ref: '#/components/parameters/Cursor'
+      - name: device_id
+        in: query
+        required: true
+        schema:
+          type: string
+      - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncPullResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - TECHNICIAN
+      x-db: select view tech_*, work_orders, anak WO (JWT, RLS my_active_wo_ids) memakai updated_at; tidak ada sync_changes
+        (G-05)
+      x-layer: 1
+      x-jalur: B
+      x-error-codes:
+      - RATE_LIMITED
+      - APP_UPDATE_REQUIRED
+  /internal/jobs/{job}:
+    post:
+      operationId: runInternalJob
+      summary: Picu job terjadwal (cadangan pg_cron) atau worker aplikasi
+      tags:
+      - internal
+      description: |-
+        Authorization: Bearer CRON_SECRET. Job DB (lewat app.run_job): sla_check, pm_generate, pm_missed, expire_customer_actions, parts_variance_finalize, retention_purge. Job aplikasi: dispatch_notifications (kirim notifications PENDING), render_reports (service_reports GENERATING ke READY), purge_storage (TODO retensi foto). Semua idempoten. `app.run_job` tidak terekspos PostgREST: perlu pembungkus public untuk service role (G-07).
+
+        Peran (enum app_role): SYSTEM. Lapis produk: 2.
+
+        Backing database: app.run_job(p_name) / worker.
+      parameters:
+      - name: job
+        in: path
+        required: true
+        schema:
+          type: string
+          enum:
+          - sla_check
+          - pm_generate
+          - pm_missed
+          - expire_customer_actions
+          - parts_variance_finalize
+          - retention_purge
+          - dispatch_notifications
+          - render_reports
+          - purge_storage
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobRunResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - cronAuth: []
+      x-roles:
+      - SYSTEM
+      x-db: app.run_job(p_name) / worker
+      x-layer: 2
+      x-jalur: B
+  /internal/webhooks/{provider}:
+    post:
+      operationId: receiveProviderWebhook
+      summary: Terima status pengiriman dari penyedia email/WA
+      tags:
+      - internal
+      description: |-
+        HMAC (X-Vasta-Signature). Mengubah notifications.status/last_error lewat service role (worker, 05 bagian 6d). [A] penyedia belum dipilih (D5/D6).
+
+        Peran (enum app_role): SYSTEM. Lapis produk: 2.
+
+        Backing database: update notifications (service role).
+      parameters:
+      - name: provider
+        in: path
+        required: true
+        schema:
+          type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderWebhookEvent'
+      responses:
+        '202':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Accepted'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - webhookSignature: []
+      x-roles:
+      - SYSTEM
+      x-db: update notifications (service role)
+      x-layer: 2
+      x-jalur: B
+  /invoices:
+    post:
+      operationId: createInvoice
+      summary: Buat invoice DRAFT dari WO CLOSED siap tagih (v_finance_ready_to_bill)
+      tags:
+      - lapis3
+      description: |-
+        Peran (enum app_role): FINANCE. Lapis produk: 3.
+
+        Backing database: RPC belum ada di 04 (G-10); sementara insert invoices/invoice_lines oleh FIN (Jalur A).
+
+        Kode error domain: `WO_NOT_CLOSED` (409); `WO_NOT_BILLABLE` (409); `ALREADY_INVOICED` (409).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoiceCreate'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invoice'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - FINANCE
+      x-db: RPC belum ada di 04 (G-10); sementara insert invoices/invoice_lines oleh FIN (Jalur A)
+      x-layer: 3
+      x-jalur: B
+      x-error-codes:
+      - WO_NOT_CLOSED
+      - WO_NOT_BILLABLE
+      - ALREADY_INVOICED
+  /invoices/{invoiceId}/issue:
+    post:
+      operationId: issueInvoice
+      summary: Terbitkan invoice
+      tags:
+      - lapis3
+      description: |-
+        Peran (enum app_role): FINANCE. Lapis produk: 3.
+
+        Backing database: RPC belum ada (G-10).
+
+        Kode error domain: `INVOICE_NOT_DRAFT` (409).
+      parameters:
+      - name: invoiceId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmptyBody'
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Invoice'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - FINANCE
+      x-db: RPC belum ada (G-10)
+      x-layer: 3
+      x-jalur: B
+      x-error-codes:
+      - INVOICE_NOT_DRAFT
+  /invoices/{invoiceId}/payments:
+    post:
+      operationId: recordPayment
+      summary: Catat pembayaran manual (bukan payment gateway)
+      tags:
+      - lapis3
+      description: |-
+        Peran (enum app_role): FINANCE. Lapis produk: 3.
+
+        Backing database: RPC belum ada (G-10).
+
+        Kode error domain: `INVOICE_NOT_DRAFT` (409); `VALIDATION_FAILED` (422).
+      parameters:
+      - name: invoiceId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PaymentBody'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IdResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - FINANCE
+      x-db: RPC belum ada (G-10)
+      x-layer: 3
+      x-jalur: B
+      x-error-codes:
+      - INVOICE_NOT_DRAFT
+      - VALIDATION_FAILED
+  /invoice-exports:
+    post:
+      operationId: createInvoiceExport
+      summary: Ekspor invoice ke CSV (format menunggu D12)
+      tags:
+      - lapis3
+      description: |-
+        Peran (enum app_role): FINANCE. Lapis produk: 3.
+
+        Backing database: Route Handler (render CSV); sumber invoices/invoice_lines.
+
+        Kode error domain: `VALIDATION_FAILED` (422).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InvoiceExportBody'
+      responses:
+        '201':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceExport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - FINANCE
+      x-db: Route Handler (render CSV); sumber invoices/invoice_lines
+      x-layer: 3
+      x-jalur: B
+      x-error-codes:
+      - VALIDATION_FAILED
+  /imports:
+    post:
+      operationId: createImport
+      summary: Mulai impor Excel (dry-run)
+      tags:
+      - lapis3
+      description: |-
+        Peran (enum app_role): ADMIN_CS, WAREHOUSE. Lapis produk: 3.
+
+        Backing database: insert import_jobs; logika validasi TODO di 04 (G-10).
+
+        Kode error domain: `VALIDATION_FAILED` (422).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportBody'
+      responses:
+        '202':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/Unprocessable'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      - WAREHOUSE
+      x-db: insert import_jobs; logika validasi TODO di 04 (G-10)
+      x-layer: 3
+      x-jalur: B
+      x-error-codes:
+      - VALIDATION_FAILED
+  /imports/{importId}/commit:
+    post:
+      operationId: commitImport
+      summary: Commit impor bebas galat
+      tags:
+      - lapis3
+      description: |-
+        Peran (enum app_role): ADMIN_CS, WAREHOUSE. Lapis produk: 3.
+
+        Backing database: TODO di 04 (G-10).
+
+        Kode error domain: `IMPORT_HAS_ERRORS` (409).
+      parameters:
+      - name: importId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      responses:
+        '200':
+          description: Berhasil.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ImportJob'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        default:
+          $ref: '#/components/responses/ProblemDefault'
+      security:
+      - bearerAuth: []
+      x-roles:
+      - ADMIN_CS
+      - WAREHOUSE
+      x-db: TODO di 04 (G-10)
+      x-layer: 3
+      x-jalur: B
+      x-error-codes:
+      - IMPORT_HAS_ERRORS
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token Supabase Auth. Claim aplikasi ada di app_metadata (roles, customer_id, customer_role, technician_id).
+    cronAuth:
+      type: http
+      scheme: bearer
+      description: Rahasia pekerjaan terjadwal (CRON_SECRET), hanya di server.
+    webhookSignature:
+      type: apiKey
+      in: header
+      name: X-Vasta-Signature
+      description: Format t=<unix>,v1=<hex HMAC-SHA256 atas "t.body">. Toleransi waktu [P].
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        format: uuid
+      description: UUID v7 unik per niat aksi; diteruskan sebagai p_op_id ke RPC (uq_wsh_op). Pengulangan mengembalikan hasil
+        lama dengan replayed=true.
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema:
+        type: string
+      description: 'Versi entitas, contoh "7"; diteruskan sebagai p_expected_version. Tidak cocok: 409 VERSION_CONFLICT (WO004).
+        Tidak ada: 428.'
+    IfMatchOptional:
+      name: If-Match
+      in: header
+      required: false
+      schema:
+        type: string
+      description: Opsional untuk aksi teknisi; konflik dinilai per kategori kepemilikan data (02 bagian 6.3).
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      schema:
+        type: string
+      description: Cursor opaque dari next_cursor.
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+      description: Default dan maksimum adalah [P] (belum ditetapkan).
+  responses:
+    BadRequest:
+      description: Permintaan tidak dapat diurai atau header wajib hilang.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: Tidak terautentikasi (UNAUTHENTICATED).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: Peran tidak diizinkan (FORBIDDEN_ROLE) atau akun nonaktif (ACCOUNT_INACTIVE).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: Tidak ditemukan atau di luar cakupan pemanggil (NOT_FOUND, seragam).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: Konflik status/versi/idempotensi.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: Payload terlalu besar.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UnsupportedMediaType:
+      description: Tipe media tidak didukung.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unprocessable:
+      description: Validasi gagal atau aturan bisnis tidak terpenuhi.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    UpgradeRequired:
+      description: Versi aplikasi klien terlalu lama (APP_UPDATE_REQUIRED).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PreconditionRequired:
+      description: If-Match wajib.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    TooManyRequests:
+      description: Batas laju terlampaui.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+      headers:
+        Retry-After:
+          description: Detik sampai boleh mencoba lagi.
+          schema:
+            type: integer
+        RateLimit-Limit:
+          description: Kuota jendela saat ini ([P], tidak ditetapkan di dokumen).
+          schema:
+            type: integer
+        RateLimit-Remaining:
+          schema:
+            type: integer
+        RateLimit-Reset:
+          description: Detik sampai jendela reset.
+          schema:
+            type: integer
+    ServiceUnavailable:
+      description: Layanan pendukung tidak tersedia; aman diulang.
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ProblemDefault:
+      description: Galat lain (application/problem+json).
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+  schemas:
+    Id:
+      type: string
+      format: uuid
+    Timestamp:
+      type: string
+      format: date-time
+      description: ISO 8601 UTC, contoh 2026-11-02T08:15:30Z.
+    Money:
+      type: object
+      required:
+      - amount
+      - currency
+      properties:
+        amount:
+          type: string
+          pattern: ^-?\d+(\.\d{1,2})?$
+          description: Desimal sebagai string (kolom numeric(14,2) di 04).
+        currency:
+          type: string
+          default: IDR
+          description: '[A] Mata uang implisit tunggal (D24).'
+    AppRole:
+      type: string
+      description: Enum app_role di 04.
+      enum:
+      - CUSTOMER
+      - ADMIN_CS
+      - DISPATCHER
+      - TECHNICIAN
+      - SUPERVISOR
+      - WAREHOUSE
+      - FINANCE
+      - OWNER
+    RequestStatus:
+      type: string
+      enum:
+      - SUBMITTED
+      - NEEDS_INFO
+      - REJECTED
+      - CONVERTED
+      - CANCELLED_BY_CUSTOMER
+    WoStatus:
+      type: string
+      enum:
+      - NEW
+      - ASSIGNED
+      - ACCEPTED
+      - EN_ROUTE
+      - IN_PROGRESS
+      - ON_HOLD_PARTS
+      - AWAITING_CUSTOMER_APPROVAL
+      - AWAITING_SIGNOFF
+      - UNDER_REVIEW
+      - RETURNED
+      - CLOSED
+      - CANCELLED
+    DisplayStatus:
+      type: string
+      description: 'Hasil app.customer_status(); dihitung di database (4.2 di 02). Untuk permintaan non-WO: RECEIVED, UNPROCESSABLE,
+        CANCELLED.'
+      enum:
+      - RECEIVED
+      - SCHEDULED
+      - EN_ROUTE
+      - IN_PROGRESS
+      - AWAITING_CUSTOMER
+      - COMPLETED
+      - CANCELLED
+      - UNPROCESSABLE
+    WoOutcome:
+      type: string
+      enum:
+      - RESOLVED
+      - PARTIAL
+      - UNRESOLVED
+    BillingType:
+      type: string
+      enum:
+      - BILLABLE
+      - WARRANTY
+      - COVERED_CONTRACT
+      - WARRANTY_WORK
+    ApprovalStatus:
+      type: string
+      enum:
+      - PENDING
+      - APPROVED
+      - REJECTED
+      - EXPIRED
+      - SUPERSEDED
+    DecisionChannel:
+      type: string
+      enum:
+      - PWA
+      - PHONE
+      - CHAT
+      - OTHER
+    ProblemFieldError:
+      type: object
+      required:
+      - pointer
+      - code
+      properties:
+        pointer:
+          type: string
+          description: JSON Pointer ke field bermasalah.
+        code:
+          type: string
+        detail:
+          type: string
+    ClosureUnmet:
+      type: object
+      required:
+      - code
+      description: Elemen DETAIL jsonb WO003 dari app.wo_submit_deficiencies (kunci tambahan seperti kind, missing, min_length
+        diteruskan apa adanya).
+      additionalProperties: true
+      properties:
+        code:
+          type: string
+          enum:
+          - WO_NOT_FOUND
+          - CHECKLIST_INCOMPLETE
+          - PHOTO_MISSING
+          - CHECK_IN_MISSING
+          - SIGNATURE_MISSING
+          - CLOSURE_EXCEPTION_NOT_APPROVED
+          - EXTRA_COST_PENDING
+          - PARTS_NOT_DECLARED
+          - FINDINGS_INCOMPLETE
+          - SYNC_PENDING
+          - SYNC_STATE_UNKNOWN
+          - SYNC_UNAPPLIED
+    Problem:
+      type: object
+      description: RFC 9457 Problem Details.
+      required:
+      - type
+      - title
+      - status
+      - code
+      - request_id
+      additionalProperties: true
+      properties:
+        type:
+          type: string
+          format: uri-reference
+          description: '[A] URI stabil per code, contoh /problems/invalid-transition.'
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+          description: Pesan Bahasa Indonesia yang dapat ditampilkan ke pengguna.
+        instance:
+          type: string
+        code:
+          type: string
+          description: Kode domain UPPER_SNAKE (katalog 03 bagian 5).
+        db_sqlstate:
+          type: string
+          description: SQLSTATE kustom dari 04 (WO001..WO006, STK01, RL001, IMM01); hanya untuk diagnosis.
+        request_id:
+          type: string
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProblemFieldError'
+        unmet:
+          type: array
+          items:
+            $ref: '#/components/schemas/ClosureUnmet'
+        warnings:
+          type: array
+          description: 'Contoh untuk SOFT_GUARD: SKILL_MISMATCH, SCHEDULE_OVERLAP.'
+          items:
+            type: object
+            additionalProperties: true
+        allowed_actions:
+          type: array
+          items:
+            type: string
+        current_version:
+          type: integer
+        current_status:
+          type: string
+        retry_after_seconds:
+          type: integer
+    RegistrationRequest:
+      type: object
+      required:
+      - email
+      - captcha_token
+      properties:
+        email:
+          type: string
+          format: email
+        captcha_token:
+          type: string
+    Accepted:
+      type: object
+      required:
+      - message
+      properties:
+        message:
+          type: string
+    CompleteRegistrationRequest:
+      type: object
+      required:
+      - full_name
+      - policy_version
+      properties:
+        full_name:
+          type: string
+          minLength: 1
+        phone:
+          type: string
+        policy_version:
+          type: string
+    AcceptInvitationRequest:
+      type: object
+      required:
+      - token
+      - policy_version
+      properties:
+        token:
+          type: string
+        policy_version:
+          type: string
+    CustomerRef:
+      type: object
+      required:
+      - customer_id
+      properties:
+        customer_id:
+          $ref: '#/components/schemas/Id'
+    Me:
+      type: object
+      required:
+      - user_id
+      - roles
+      - is_active
+      properties:
+        user_id:
+          $ref: '#/components/schemas/Id'
+        full_name:
+          type: string
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppRole'
+        customer_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+        technician_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        is_active:
+          type: boolean
+    InvitationRequest:
+      type: object
+      required:
+      - email
+      properties:
+        email:
+          type: string
+          format: email
+        customer_role:
+          type: string
+          enum:
+          - ADMIN
+          - MEMBER
+          default: MEMBER
+    Invitation:
+      type: object
+      required:
+      - id
+      - email
+      - expires_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        email:
+          type: string
+          format: email
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+    StaffUserCreate:
+      type: object
+      required:
+      - email
+      - full_name
+      - roles
+      properties:
+        email:
+          type: string
+          format: email
+        full_name:
+          type: string
+        phone:
+          type: string
+        roles:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/AppRole'
+    StaffUserPatch:
+      type: object
+      properties:
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppRole'
+        is_active:
+          type: boolean
+    StaffUser:
+      type: object
+      required:
+      - user_id
+      - roles
+      - is_active
+      properties:
+        user_id:
+          $ref: '#/components/schemas/Id'
+        email:
+          type: string
+          format: email
+        full_name:
+          type: string
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/AppRole'
+        is_active:
+          type: boolean
+    SignUploadRequest:
+      type: object
+      required:
+      - resource
+      properties:
+        resource:
+          type: string
+          enum:
+          - REQUEST_ATTACHMENT
+          - WO_ATTACHMENT
+          - WO_SIGNATURE
+          - WO_SIGNATURE_PWA
+          description: 'WO_SIGNATURE_PWA: tanda tangan pelanggan via PWA; barisnya baru dibuat oleh wo_customer_sign sehingga
+            tidak ada metadata lebih dulu (pakai wo_id + file_name).'
+        id:
+          $ref: '#/components/schemas/Id'
+        wo_id:
+          $ref: '#/components/schemas/Id'
+        file_name:
+          type: string
+    UploadTarget:
+      type: object
+      required:
+      - id
+      - method
+      - upload_url
+      - expires_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        method:
+          type: string
+          enum:
+          - PUT
+        upload_url:
+          type: string
+          format: uri
+          description: Signed upload URL Supabase Storage berumur pendek.
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        max_bytes:
+          type: integer
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+    CompleteUploadRequest:
+      type: object
+      required:
+      - resource
+      properties:
+        resource:
+          type: string
+          enum:
+          - REQUEST_ATTACHMENT
+          - WO_ATTACHMENT
+          - WO_SIGNATURE
+          - WO_SIGNATURE_PWA
+        id:
+          $ref: '#/components/schemas/Id'
+        wo_id:
+          $ref: '#/components/schemas/Id'
+        file_name:
+          type: string
+    Attachment:
+      type: object
+      required:
+      - id
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        upload_status:
+          type:
+          - string
+          - 'null'
+          enum:
+          - PENDING
+          - UPLOADED
+          - FAILED
+          - null
+          description: null untuk wo_signatures (tidak ada kolom upload_status, G-04).
+    DownloadUrlsRequest:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required:
+            - type
+            - id
+            properties:
+              type:
+                type: string
+                enum:
+                - REQUEST_ATTACHMENT
+                - WO_ATTACHMENT
+                - WO_SIGNATURE
+                - SERVICE_REPORT
+              id:
+                $ref: '#/components/schemas/Id'
+    DownloadUrls:
+      type: object
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required:
+            - type
+            - id
+            - url
+            - expires_at
+            properties:
+              type:
+                type: string
+              id:
+                $ref: '#/components/schemas/Id'
+              url:
+                type: string
+                format: uri
+              expires_at:
+                $ref: '#/components/schemas/Timestamp'
+    ReasonOnly:
+      type: object
+      required:
+      - reason
+      properties:
+        reason:
+          type: string
+          minLength: 1
+        reason_code:
+          type: string
+          description: Kategori REQUEST_REJECT pada reason_codes (untuk reject).
+    ApproveRequestBody:
+      type: object
+      properties:
+        priority_code:
+          type: string
+          description: priorities.code; default dari service_types.default_priority_code.
+        service_type_id:
+          $ref: '#/components/schemas/Id'
+        estimate_total:
+          $ref: '#/components/schemas/Money'
+        reason:
+          type: string
+    DecisionResult:
+      type: object
+      required:
+      - decision
+      properties:
+        decision:
+          type: string
+          enum:
+          - APPROVE
+          - NEEDS_INFO
+          - REJECT
+        wo_id:
+          $ref: '#/components/schemas/Id'
+        wo_number:
+          type: string
+    ApproveRequestResult:
+      type: object
+      required:
+      - decision
+      - wo_id
+      - wo_number
+      properties:
+        decision:
+          type: string
+          enum:
+          - APPROVE
+        wo_id:
+          $ref: '#/components/schemas/Id'
+        wo_number:
+          type: string
+          examples:
+          - WO-2026-000123
+    EmptyBody:
+      type: object
+      additionalProperties: false
+    ClientCaptured:
+      type: object
+      properties:
+        client_ts:
+          $ref: '#/components/schemas/Timestamp'
+    ReasonBody:
+      type: object
+      required:
+      - reason
+      properties:
+        reason_code:
+          type: string
+          description: reason_codes.code sesuai kategori aksi.
+        reason:
+          type: string
+          minLength: 1
+    NoteBody:
+      type: object
+      properties:
+        note:
+          type: string
+    TransitionResult:
+      type: object
+      required:
+      - status
+      - version
+      - replayed
+      description: 'Bentuk jsonb yang dikembalikan wo_transition: {status, version, replayed, warnings}. Field tambahan sesuai
+        aksi.'
+      additionalProperties: true
+      properties:
+        status:
+          $ref: '#/components/schemas/WoStatus'
+        display_status:
+          $ref: '#/components/schemas/DisplayStatus'
+        version:
+          type: integer
+        replayed:
+          type: boolean
+          description: true bila p_op_id sama sudah pernah diterapkan (uq_wsh_op).
+        warnings:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+        approval_id:
+          $ref: '#/components/schemas/Id'
+    AssignBody:
+      type: object
+      required:
+      - technician_id
+      - scheduled_start
+      - scheduled_end
+      properties:
+        technician_id:
+          $ref: '#/components/schemas/Id'
+        scheduled_start:
+          $ref: '#/components/schemas/Timestamp'
+        scheduled_end:
+          $ref: '#/components/schemas/Timestamp'
+        override_reason:
+          type: string
+          description: Wajib bila server mengembalikan SOFT_GUARD (D20).
+    ReassignBody:
+      type: object
+      required:
+      - technician_id
+      - scheduled_start
+      - reason
+      properties:
+        technician_id:
+          $ref: '#/components/schemas/Id'
+        scheduled_start:
+          $ref: '#/components/schemas/Timestamp'
+        scheduled_end:
+          $ref: '#/components/schemas/Timestamp'
+        reason_code:
+          type: string
+        reason:
+          type: string
+          minLength: 1
+        override_reason:
+          type: string
+    CheckInBody:
+      type: object
+      properties:
+        lat:
+          type: number
+          minimum: -90
+          maximum: 90
+        lng:
+          type: number
+          minimum: -180
+          maximum: 180
+        accuracy_m:
+          type: number
+          minimum: 0
+        no_gps_reason:
+          type: string
+          description: Wajib bila lat/lng kosong (FR-053).
+        client_ts:
+          $ref: '#/components/schemas/Timestamp'
+    SubmitBody:
+      type: object
+      required:
+      - client_pending_ops
+      properties:
+        outcome:
+          $ref: '#/components/schemas/WoOutcome'
+        reason:
+          type: string
+          description: Wajib untuk T-14 (outcome PARTIAL/UNRESOLVED dari AWAITING_CUSTOMER_APPROVAL).
+        closure_exception_code:
+          type: string
+          description: 'reason_codes kategori CLOSURE_EXCEPTION: CUSTOMER_ABSENT, CUSTOMER_REFUSED, OTHER.'
+        closure_exception_note:
+          type: string
+        lat:
+          type: number
+        lng:
+          type: number
+        client_pending_ops:
+          type: integer
+          minimum: 0
+          description: Jumlah operasi outbox WO ini yang belum ACK; harus 0 (BR-040 butir 8).
+        client_ts:
+          $ref: '#/components/schemas/Timestamp'
+    SignoffBody:
+      type: object
+      required:
+      - signer_name
+      - storage_path
+      properties:
+        signer_name:
+          type: string
+          minLength: 1
+        storage_path:
+          type: string
+          description: 'Path objek tanda tangan di bucket wo-media: {customer_id}/wo/{wo_id}/...'
+        device_meta:
+          type: object
+          additionalProperties: true
+    ReviewApproveBody:
+      type: object
+      properties:
+        approve_exception:
+          type: boolean
+          description: Wajib true bila WO closure_exception=true (BR-041).
+        comment:
+          type: string
+    CancelBody:
+      type: object
+      required:
+      - reason_code
+      - reason
+      properties:
+        reason_code:
+          type: string
+          description: Kategori CANCEL pada reason_codes.
+        reason:
+          type: string
+          minLength: 1
+        outcome:
+          $ref: '#/components/schemas/WoOutcome'
+    CancelRequestResult:
+      type: object
+      required:
+      - cancelled
+      properties:
+        cancelled:
+          type: boolean
+          description: true bila WO berstatus NEW dan langsung dibatalkan (CANCEL_BY_CUSTOMER); false bila hanya pengajuan
+            dicatat.
+        requested_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+    AddHelperBody:
+      type: object
+      required:
+      - technician_id
+      properties:
+        technician_id:
+          $ref: '#/components/schemas/Id'
+    IdResult:
+      type: object
+      required:
+      - id
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+    FailedVisitBody:
+      type: object
+      required:
+      - reason
+      properties:
+        reason_code:
+          type: string
+          description: Kategori FAILED_VISIT.
+        reason:
+          type: string
+          minLength: 1
+        result:
+          type: string
+          enum:
+          - FAILED_ABSENT
+          - FAILED_OTHER
+        client_ts:
+          $ref: '#/components/schemas/Timestamp'
+    PriorityBody:
+      type: object
+      required:
+      - priority_code
+      - reason
+      properties:
+        priority_code:
+          type: string
+        reason:
+          type: string
+          minLength: 1
+    EstimateBody:
+      type: object
+      required:
+      - estimate_total
+      properties:
+        estimate_total:
+          $ref: '#/components/schemas/Money'
+    BillingOverrideBody:
+      type: object
+      required:
+      - billing_type
+      - reason
+      properties:
+        billing_type:
+          $ref: '#/components/schemas/BillingType'
+        reason:
+          type: string
+          minLength: 1
+    ReworkBody:
+      type: object
+      required:
+      - reason
+      properties:
+        reason:
+          type: string
+          minLength: 1
+        priority_code:
+          type: string
+        complaint_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    CostSummary:
+      type: object
+      additionalProperties: true
+      properties:
+        estimate_total:
+          type:
+          - number
+          - 'null'
+        projected_total:
+          type: number
+        tolerance:
+          type: number
+        needs_approval:
+          type: boolean
+    ExtraCostRequest:
+      type: object
+      required:
+      - reason
+      - items
+      properties:
+        reason:
+          type: string
+          minLength: 1
+        items:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required:
+            - kind
+            - qty
+            properties:
+              kind:
+                type: string
+                enum:
+                - LABOR
+                - PART
+                - OTHER
+              ref_id:
+                type:
+                - string
+                - 'null'
+                format: uuid
+                description: service_items.id (LABOR) atau items.id (PART); harga dari master.
+              description:
+                type: string
+              qty:
+                type: number
+                exclusiveMinimum: 0
+              unit_price:
+                type: number
+                minimum: 0
+                description: Hanya dipakai untuk kind OTHER.
+    ExtraCostRequestResult:
+      type: object
+      required:
+      - approval_id
+      - approval_version
+      - content_hash
+      additionalProperties: true
+      properties:
+        status:
+          $ref: '#/components/schemas/WoStatus'
+        version:
+          type: integer
+        approval_id:
+          $ref: '#/components/schemas/Id'
+        approval_version:
+          type: integer
+        content_hash:
+          type: string
+        total:
+          type: number
+    ExtraCostDecision:
+      type: object
+      required:
+      - decision
+      - content_hash
+      properties:
+        decision:
+          type: string
+          enum:
+          - APPROVE
+          - REJECT
+        content_hash:
+          type: string
+          description: content_hash dari customer_extra_cost_approvals yang ditampilkan (BR-051).
+        continue_original_scope:
+          type: boolean
+          default: true
+          description: Hanya untuk REJECT. false = WO tetap menunggu keputusan teknisi (T-14).
+        channel:
+          $ref: '#/components/schemas/DecisionChannel'
+        evidence_note:
+          type: string
+          description: Wajib bila ADM atas nama pelanggan (channel bukan PWA).
+    PartRequestCreate:
+      type: object
+      required:
+      - lines
+      properties:
+        note:
+          type: string
+        lines:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required:
+            - item_id
+            - qty
+            properties:
+              item_id:
+                $ref: '#/components/schemas/Id'
+              qty:
+                type: number
+                exclusiveMinimum: 0
+    DecisionBody:
+      type: object
+      required:
+      - decision
+      properties:
+        decision:
+          type: string
+          enum:
+          - APPROVE
+          - REJECT
+        note:
+          type: string
+    IssueBody:
+      type: object
+      required:
+      - qty
+      properties:
+        qty:
+          type: number
+          exclusiveMinimum: 0
+        from_location_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    PartReturnCreate:
+      type: object
+      required:
+      - lines
+      properties:
+        note:
+          type: string
+        lines:
+          type: array
+          minItems: 1
+          items:
+            type: object
+            required:
+            - item_id
+            - qty
+            properties:
+              item_id:
+                $ref: '#/components/schemas/Id'
+              qty:
+                type: number
+                exclusiveMinimum: 0
+    PartReturnConfirm:
+      type: object
+      properties:
+        reject:
+          type: boolean
+          default: false
+        to_location_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+        lines:
+          type: array
+          items:
+            type: object
+            required:
+            - item_id
+            - confirmed_qty
+            properties:
+              item_id:
+                $ref: '#/components/schemas/Id'
+              confirmed_qty:
+                type: number
+                minimum: 0
+    StockReceiptBody:
+      type: object
+      required:
+      - item_id
+      - location_id
+      - qty
+      properties:
+        item_id:
+          $ref: '#/components/schemas/Id'
+        location_id:
+          $ref: '#/components/schemas/Id'
+        qty:
+          type: number
+          exclusiveMinimum: 0
+        note:
+          type: string
+    StockAdjustBody:
+      type: object
+      required:
+      - item_id
+      - location_id
+      - delta
+      - reason
+      properties:
+        item_id:
+          $ref: '#/components/schemas/Id'
+        location_id:
+          $ref: '#/components/schemas/Id'
+        delta:
+          type: number
+          not:
+            const: 0
+        reason:
+          type: string
+          minLength: 1
+    VarianceResolve:
+      type: object
+      required:
+      - status
+      - note
+      properties:
+        status:
+          type: string
+          enum:
+          - EXPLAINED
+          - RETURNED_LATE
+          - WRITTEN_OFF
+          - CHARGED_TO_CUSTOMER
+        note:
+          type: string
+          minLength: 1
+    PmResolveBody:
+      type: object
+      required:
+      - action
+      - reason
+      properties:
+        action:
+          type: string
+          enum:
+          - SKIP
+          - CREATE_NOW
+        reason:
+          type: string
+          minLength: 1
+    PmResolveResult:
+      type: object
+      required:
+      - action
+      properties:
+        action:
+          type: string
+          enum:
+          - SKIP
+          - CREATE_NOW
+        wo_id:
+          type:
+          - string
+          - 'null'
+          format: uuid
+    SyncOpType:
+      type: string
+      enum:
+      - ACCEPT
+      - REJECT
+      - RELEASE
+      - DEPART
+      - CHECK_IN
+      - HOLD_PARTS
+      - RESUME_PARTS
+      - REQUEST_SIGNOFF
+      - SUBMIT_REVIEW
+      - CLOSE_AFTER_REJECTION
+      - RESUME_AFTER_RETURN
+      - VISIT_FAILED
+      - HELP_REQUEST
+      - REQUEST_EXTRA_COST
+      - SET_CHECKLIST_ITEM
+      - SET_FINDINGS
+      - ADD_PHOTO
+      - TOMBSTONE_PHOTO
+      - ADD_SIGNATURE
+      - ADD_LABOR_LINE
+      - REMOVE_LABOR_LINE
+      - ADD_PART_USAGE
+      - REMOVE_PART_USAGE
+      - CREATE_PART_REQUEST
+      - CREATE_PART_RETURN
+    SyncOp:
+      type: object
+      required:
+      - op_id
+      - seq
+      - wo_id
+      - type
+      - client_captured_at
+      - payload
+      properties:
+        op_id:
+          type: string
+          format: uuid
+          description: UUID v7 dibuat di klien saat aksi dilakukan; PK sync_operations dan p_op_id.
+        seq:
+          type: integer
+          minimum: 1
+          description: Naik monoton per (device_id, wo_id).
+        wo_id:
+          $ref: '#/components/schemas/Id'
+        type:
+          $ref: '#/components/schemas/SyncOpType'
+        base_version:
+          type: integer
+          description: Versi WO di cache saat aksi dibuat; menjadi p_expected_version bila relevan.
+        client_captured_at:
+          $ref: '#/components/schemas/Timestamp'
+        payload:
+          type: object
+          additionalProperties: true
+          description: 'Bentuk payload per tipe: lihat x-sync-payload-schemas dan 03 bagian 7.3.'
+      x-sync-payload-schemas:
+        ACCEPT: '{}'
+        REJECT: '{reason_code, reason}'
+        RELEASE: '{reason_code, reason}'
+        DEPART: '{}'
+        CHECK_IN: '{lat, lng, accuracy_m, no_gps_reason, client_ts}'
+        HOLD_PARTS: '{}'
+        RESUME_PARTS: '{}'
+        REQUEST_SIGNOFF: '{outcome, client_pending_ops, ...}'
+        SUBMIT_REVIEW: '{outcome, lat, lng, client_pending_ops, closure_exception_code, closure_exception_note}'
+        CLOSE_AFTER_REJECTION: '{outcome: PARTIAL atau UNRESOLVED, client_pending_ops}; reason wajib'
+        RESUME_AFTER_RETURN: '{}'
+        VISIT_FAILED: '{result}; reason wajib; foto FAILED_VISIT sudah ACK'
+        HELP_REQUEST: '{note}'
+        REQUEST_EXTRA_COST: '{reason, items[]}'
+        SET_CHECKLIST_ITEM: '{item_id, value, is_na, na_reason}'
+        SET_FINDINGS: '{diagnosis, action_taken, recommendation, internal_note}'
+        ADD_PHOTO: '{photo_id, kind, mime, bytes, sha256, taken_at, storage_path}'
+        TOMBSTONE_PHOTO: '{photo_id}'
+        ADD_SIGNATURE: '{signature_id, signer_name, storage_path, device_meta}'
+        ADD_LABOR_LINE: '{line_id, service_item_id, description, qty, is_extra, extra_approval_id, emergency, emergency_reason}'
+        REMOVE_LABOR_LINE: '{line_id}'
+        ADD_PART_USAGE: '{usage_id, item_id, qty, is_extra, extra_approval_id, emergency, emergency_reason, source_location_id}'
+        REMOVE_PART_USAGE: '{usage_id}'
+        CREATE_PART_REQUEST: '{lines[], note}'
+        CREATE_PART_RETURN: '{lines[], note}'
+    SyncPushRequest:
+      type: object
+      required:
+      - device_id
+      - schema_version
+      - client_time
+      - ops
+      properties:
+        device_id:
+          type: string
+          description: sync_operations.device_id bertipe text.
+        schema_version:
+          type: integer
+        client_time:
+          $ref: '#/components/schemas/Timestamp'
+        ops:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/SyncOp'
+          description: Batas jumlah operasi per batch adalah [P] (belum ditetapkan).
+    SyncOpResult:
+      type: object
+      required:
+      - op_id
+      - status
+      properties:
+        op_id:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum:
+          - ACKED
+          - REJECTED
+          - RETRY
+          - HELD
+          description: ACKED (termasuk replay), REJECTED (permanen), RETRY (galat sementara), HELD (celah seq).
+        code:
+          type:
+          - string
+          - 'null'
+        detail:
+          type:
+          - string
+          - 'null'
+        replayed:
+          type: boolean
+        result:
+          type:
+          - object
+          - 'null'
+          additionalProperties: true
+        expected_seq:
+          type:
+          - integer
+          - 'null'
+        db_status:
+          type: string
+          enum:
+          - RECEIVED
+          - APPLIED
+          - REJECTED
+          - RESCUED
+          description: Nilai sync_operations.status (enum sync_op_status).
+        clock_skew:
+          type: boolean
+        retry_after_seconds:
+          type:
+          - integer
+          - 'null'
+    SyncPushResponse:
+      type: object
+      required:
+      - server_time
+      - results
+      properties:
+        server_time:
+          $ref: '#/components/schemas/Timestamp'
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncOpResult'
+    SyncChange:
+      type: object
+      required:
+      - entity
+      - id
+      properties:
+        entity:
+          type: string
+          enum:
+          - WORK_ORDER
+          - CHECKLIST_ITEMS
+          - FINDINGS
+          - ATTACHMENTS
+          - SIGNATURES
+          - LABOR_LINES
+          - PART_USAGES
+          - EXTRA_COST_APPROVAL
+          - PART_REQUEST
+          - ASSET_HISTORY
+          - STOCK_BALANCE
+        id:
+          $ref: '#/components/schemas/Id'
+        version:
+          type: integer
+        data:
+          type: object
+          additionalProperties: true
+          description: Dibaca dari view tech_* atau tabel yang diizinkan RLS; tanpa harga (AP-2).
+    SyncPullResponse:
+      type: object
+      required:
+      - server_time
+      - snapshot
+      - changes
+      - active_wo_ids
+      - next_cursor
+      - has_more
+      properties:
+        server_time:
+          $ref: '#/components/schemas/Timestamp'
+        snapshot:
+          type: boolean
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncChange'
+        active_wo_ids:
+          type: array
+          description: Himpunan lengkap app.my_active_wo_ids() saat ini. WO yang ada di cache tetapi tidak di sini harus dibersihkan
+            (setelah outbox WO itu kosong atau jadi draf diselamatkan). Menggantikan tombstone REMOVE karena 04 tidak punya
+            umpan perubahan (G-05).
+          items:
+            $ref: '#/components/schemas/Id'
+        next_cursor:
+          type: string
+        has_more:
+          type: boolean
+    JobRunResult:
+      type: object
+      required:
+      - job
+      - processed
+      properties:
+        job:
+          type: string
+        processed:
+          type: integer
+        job_run_id:
+          type: integer
+    ProviderWebhookEvent:
+      type: object
+      required:
+      - event_id
+      additionalProperties: true
+      properties:
+        event_id:
+          type: string
+          description: Dipakai untuk deduplikasi.
+    InvoiceCreate:
+      type: object
+      required:
+      - wo_ids
+      properties:
+        wo_ids:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/Id'
+    Invoice:
+      type: object
+      required:
+      - id
+      - status
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        invoice_no:
+          type:
+          - string
+          - 'null'
+        status:
+          type: string
+          enum:
+          - DRAFT
+          - ISSUED
+          - PAID
+          - VOID
+    PaymentBody:
+      type: object
+      required:
+      - amount
+      - paid_at
+      - method
+      properties:
+        amount:
+          $ref: '#/components/schemas/Money'
+        paid_at:
+          $ref: '#/components/schemas/Timestamp'
+        method:
+          type: string
+        reference:
+          type: string
+    InvoiceExportBody:
+      type: object
+      required:
+      - format
+      properties:
+        format:
+          type: string
+          description: 'TODO: format ditetapkan setelah D12/OQ-22.'
+        invoice_ids:
+          type: array
+          items:
+            $ref: '#/components/schemas/Id'
+    InvoiceExport:
+      type: object
+      required:
+      - id
+      - download_url
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        download_url:
+          type: string
+          format: uri
+    ImportBody:
+      type: object
+      required:
+      - type
+      - file_path
+      properties:
+        type:
+          type: string
+          enum:
+          - CUSTOMERS
+          - ASSETS
+          - STOCK
+        file_path:
+          type: string
+    ImportJob:
+      type: object
+      required:
+      - id
+      - status
+      properties:
+        id:
+          $ref: '#/components/schemas/Id'
+        status:
+          type: string
+          enum:
+          - UPLOADED
+          - VALIDATED
+          - COMMITTED
+          - FAILED
+        error_report:
+          type:
+          - array
+          - 'null'
+          items:
+            type: object
+            additionalProperties: true
