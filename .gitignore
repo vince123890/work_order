@@ -9,3 +9,4 @@ coverage/
 dist/
 .vercel/
 supabase/.temp/
+*.tsbuildinfo
