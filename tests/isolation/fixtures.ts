@@ -35,6 +35,10 @@ export type Kit = {
   woAwait: string;
   woClosed: string;
   woReassign: string;
+  woProgress: string; // IN_PROGRESS, LEAD ACCEPTED (uji declare_no_parts, biaya tambahan, konkurensi)
+  woSign: string; // AWAITING_SIGNOFF (uji path tanda tangan)
+  woTagih: string; // CLOSED, billing PENDING, tanpa invoice_lines (v_finance_ready_to_bill)
+  sigRegPath: string; // path sig/ yang terdaftar di wo_attachments pada woSign
   reqSubmitted: string;
   reqClosed: string;
   // objek pada WO CLOSED
@@ -265,7 +269,7 @@ declare
   v_pt uuid := ${lit(c.ptId)}; v_st uuid := ${lit(c.stId)}; v_item uuid := ${lit(c.itemId)};
   v_svc uuid := ${lit(c.serviceItemId)}; v_l text := ${lit(b.letter)};
   r record; v_sr uuid; v_wo uuid; v_key text; v_pr uuid; v_ap uuid; v_inv_i uuid; v_inv_d uuid; v_lab uuid;
-  v_closed uuid; v_await uuid; v_req_closed uuid; v_hash text := 'uji-iso-hash-' || ${lit(b.letter)};
+  v_closed uuid; v_await uuid; v_req_closed uuid; v_prog uuid; v_sign uuid; v_hash text := 'uji-iso-hash-' || ${lit(b.letter)};
 begin
   perform set_config('app.revision_mode', 'on', true);
   for r in select * from (values
@@ -274,6 +278,9 @@ begin
       ('tunggu-persetujuan', 'AWAITING_CUSTOMER_APPROVAL', 'ACCEPTED', null),
       ('selesai', 'CLOSED', 'COMPLETED', null),
       ('tugas-ulang', 'NEW', null, null),
+      ('berjalan', 'IN_PROGRESS', 'ACCEPTED', null),
+      ('tanda-tangan', 'AWAITING_SIGNOFF', 'ACCEPTED', null),
+      ('selesai-tagih', 'CLOSED', 'COMPLETED', null),
       ('diajukan', null, null, null)) t(tag, status, assign, x) loop
     v_key := 'uji-iso:' || r.tag || ':' || v_cust::text;
     select id into v_sr from public.service_requests where customer_id = v_cust and client_request_id = md5(v_key)::uuid;
@@ -307,6 +314,8 @@ begin
       end if;
       if r.tag = 'selesai' then v_closed := v_wo; v_req_closed := v_sr; end if;
       if r.tag = 'tunggu-persetujuan' then v_await := v_wo; end if;
+      if r.tag = 'berjalan' then v_prog := v_wo; end if;
+      if r.tag = 'tanda-tangan' then v_sign := v_wo; end if;
     end if;
   end loop;
 
@@ -321,8 +330,8 @@ begin
   insert into public.wo_attachments (wo_id, kind, storage_path, upload_status, mime, bytes, taken_at, taken_by)
   values (v_await, 'AFTER', v_cust::text || '/wo/' || v_await::text || '/after-belum-selesai.jpg', 'UPLOADED', 'image/jpeg', 4, now(), v_admin)
   on conflict (storage_path) do nothing;
-  insert into public.wo_signatures (wo_id, signer_type, signer_name, storage_path, content_hash, signed_via)
-  values (v_closed, 'CUSTOMER', '[UJI ISOLASI] penanda tangan', v_cust::text || '/wo/' || v_closed::text || '/sig-uji.png', '', 'TECH_DEVICE')
+  insert into public.wo_signatures (wo_id, signer_type, signer_name, storage_path, content_hash, signed_via, upload_status)
+  values (v_closed, 'CUSTOMER', '[UJI ISOLASI] penanda tangan', v_cust::text || '/wo/' || v_closed::text || '/sig-uji.png', '', 'TECH_DEVICE', 'UPLOADED')
   on conflict (storage_path) do nothing;
   insert into public.service_reports (wo_id, customer_id, revision, status, storage_path, snapshot, snapshot_hash, generated_at)
   values (v_closed, v_cust, 1, 'READY', v_cust::text || '/wo/' || v_closed::text || '/laporan-uji.pdf', '{"catatan":"[UJI ISOLASI]"}'::jsonb, 'uji-iso', now())
@@ -351,7 +360,14 @@ begin
   select v_closed, v_tech, now() - interval '2 hour', now() - interval '1 hour', 'COMPLETED', '[UJI ISOLASI] kunjungan'
    where not exists (select 1 from public.wo_visits where wo_id = v_closed);
   insert into public.wo_checklist_items (wo_id, seq, label_snapshot, input_type, required)
-  values (v_closed, 9001, '[UJI ISOLASI] butir checklist', 'BOOLEAN', false) on conflict (wo_id, seq) do nothing;
+  select x.w, 9001, '[UJI ISOLASI] butir checklist', 'BOOLEAN', false from (values (v_closed), (v_prog)) x(w)
+  on conflict (wo_id, seq) do nothing;
+  -- path sig/ yang sudah terdaftar sebagai foto (tidak boleh dipakai sebagai tanda tangan)
+  insert into public.wo_attachments (wo_id, kind, storage_path, upload_status, mime, bytes, taken_at, taken_by)
+  values (v_sign, 'OTHER', v_cust::text || '/wo/' || v_sign::text || '/sig/terdaftar-uji.png', 'UPLOADED', 'image/png', 4, now(), v_admin)
+  on conflict (storage_path) do nothing;
+  -- data pembukti untuk view operasional: SLA tercapai (v_kpi_sla_monthly)
+  update public.work_orders set resolution_sla_state = 'MET' where id = v_closed and resolution_sla_state = 'NOT_TRACKED';
   insert into public.sla_events (wo_id, kind, level, target) values (v_closed, 'RESPONSE_WARNING', 1, 'ADMIN_CS') on conflict do nothing;
   insert into public.sla_pauses (wo_id, reason, paused_at)
   select v_closed, '[UJI ISOLASI] jeda', now() - interval '3 hour' where not exists (select 1 from public.sla_pauses where wo_id = v_closed);
@@ -367,6 +383,7 @@ begin
   select v_closed, v_tech, '[UJI ISOLASI]' where not exists (select 1 from public.part_returns where wo_id = v_closed and note = '[UJI ISOLASI]');
   insert into public.parts_variances (wo_id, item_id, technician_id, issued, used) values (v_closed, v_item, v_tech, 2, 1)
   on conflict (wo_id, item_id, technician_id) do nothing;
+  update public.parts_variances set status = 'OPEN' where wo_id = v_closed and status is null;     -- v_open_part_variances
 
   -- persetujuan biaya tambahan PENDING + itemnya (WO menunggu persetujuan)
   insert into public.extra_cost_approvals (wo_id, version_no, status, total, reason, requested_by, expires_at, content_hash)
@@ -464,6 +481,10 @@ async function readKit(db: pg.Client, b: KitBase): Promise<Kit> {
     woAwait,
     woClosed,
     woReassign: await woOf("tugas-ulang"),
+    woProgress: await woOf("berjalan"),
+    woSign: await woOf("tanda-tangan"),
+    woTagih: await woOf("selesai-tagih"),
+    sigRegPath: `${b.cust}/wo/${await woOf("tanda-tangan")}/sig/terdaftar-uji.png`,
     reqSubmitted: await reqOf("diajukan"),
     reqClosed,
     attAfter: await att("after-uji.jpg"),
@@ -578,6 +599,39 @@ async function ensureStorageRows(db: pg.Client, kits: Kit[]): Promise<boolean> {
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Memulihkan keadaan sementara yang diubah uji (WO berjalan, persetujuan biaya tambahan hasil uji, no_parts_used,
+ * operasi sinkron uji). Aman dijalankan berulang; juga menyembuhkan sisa uji yang terhenti di tengah.
+ */
+export async function resetTransient(db: pg.Client, kits: Kit[]): Promise<void> {
+  for (const k of kits) {
+    await db.query("begin");
+    try {
+      await db.query("select set_config('app.tx_active', 'on', true)");
+      await db.query(
+        `delete from public.extra_cost_approval_items where approval_id in
+           (select id from public.extra_cost_approvals where wo_id = $1)`,
+        [k.woProgress],
+      );
+      await db.query("delete from public.extra_cost_approvals where wo_id = $1", [k.woProgress]);
+      await db.query(
+        "delete from public.sla_pauses where wo_id = $1 and reason <> '[UJI ISOLASI] jeda'",
+        [k.woProgress],
+      );
+      await db.query(
+        `update public.work_orders set status = 'IN_PROGRESS', no_parts_used = false, sla_paused_at = null
+          where id = $1 and (status <> 'IN_PROGRESS' or no_parts_used or sla_paused_at is not null)`,
+        [k.woProgress],
+      );
+      await db.query("delete from public.sync_operations where device_id = 'uji-iso-transien'");
+      await db.query("commit");
+    } catch (e) {
+      await db.query("rollback");
+      throw e;
+    }
   }
 }
 
@@ -726,6 +780,16 @@ async function buildFixture(): Promise<Fixture> {
     ),
   ]);
   const storageRows = await withDb((db) => ensureStorageRows(db, [kitA, kitB]));
+  await withDb(async (db) => {
+    // teknisi 2 menjadi HELPER pada WO berjalan milik A (uji peran helper)
+    await db.query(
+      `insert into public.wo_assignments (wo_id, technician_id, role, status, assigned_by, responded_at)
+       select $1, $2, 'HELPER', 'ACCEPTED', $3, now()
+        where not exists (select 1 from public.wo_assignments where wo_id = $1 and technician_id = $2)`,
+      [kitA.woProgress, String(t2.id), ids.admin],
+    );
+    await resetTransient(db, [kitA, kitB]);
+  });
   await Promise.all([
     ensureReassign(kitA.woReassign, String(t1.id), String(t2.id)),
     ensureReassign(kitB.woReassign, String(t2.id), String(t1.id)),

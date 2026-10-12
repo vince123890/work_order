@@ -85,6 +85,8 @@ export const MUST_BE_FORBIDDEN = [
   "tech_wo_labor_lines",
   "tech_extra_cost_approvals",
   "v_items_catalog",
+  "wo_child_changes",
+  "tech_work_orders",
 ];
 
 /** Tabel terlarang yang boleh kosong di DB uji (tidak ada data pembukti) beserta alasannya. */
@@ -170,8 +172,83 @@ export const CUSTOMER_VIEW_COLUMNS: Record<string, string[]> = {
   ],
 };
 
+export const TECH_WORK_ORDERS_COLUMNS = [
+  "id",
+  "wo_number",
+  "type",
+  "customer_id",
+  "site_id",
+  "asset_id",
+  "service_type_id",
+  "request_id",
+  "contract_id",
+  "contract_asset_id",
+  "pm_period_key",
+  "parent_wo_id",
+  "priority_code",
+  "status",
+  "scheduled_start",
+  "scheduled_end",
+  "requested_at",
+  "sla_clock_start_at",
+  "sla_policy_set_id",
+  "sla_calendar_id",
+  "policy_snapshot",
+  "response_due_at",
+  "resolution_due_at",
+  "response_met_at",
+  "resolution_met_at",
+  "response_sla_state",
+  "resolution_sla_state",
+  "sla_paused_at",
+  "next_sla_check_at",
+  "pm_due_date",
+  "started_at",
+  "submitted_at",
+  "closed_at",
+  "cancelled_at",
+  "cancel_reason_code",
+  "cancel_reason",
+  "cancel_requested_at",
+  "cancel_requested_by",
+  "cancel_request_note",
+  "signoff_expires_at",
+  "closure_exception",
+  "closure_exception_code",
+  "closure_exception_note",
+  "closure_exception_approved_by",
+  "closure_exception_approved_at",
+  "outcome",
+  "no_parts_used",
+  "checklist_template_id",
+  "checklist_template_version",
+  "returned_count",
+  "rejection_count",
+  "failed_visit_count",
+  "help_requested_at",
+  "help_requested_by",
+  "help_note",
+  "customer_note",
+  "created_by",
+  "created_at",
+  "updated_at",
+  "version",
+  "children_changed_at",
+];
+
+/** Kolom harga/penagihan yang TIDAK boleh ada di tech_work_orders (G-08). */
+export const WO_PRICE_BILLING_COLUMNS = [
+  "estimate_total",
+  "estimate_version",
+  "billing_type",
+  "billing_status",
+  "billing_override_reason",
+  "warranty_exception_reason",
+];
+
 /** View teknisi/gudang (tanpa harga/margin, AP-2). */
 export const TECH_VIEW_COLUMNS: Record<string, string[]> = {
+  tech_work_orders: TECH_WORK_ORDERS_COLUMNS,
   tech_wo_part_usages: [
     "id",
     "wo_id",
@@ -263,7 +340,7 @@ export const RPC_ALLOWED: Record<string, { roles: ("CUSTOMER" | "TECHNICIAN")[];
     wo_cost_summary: {
       roles: ["TECHNICIAN"],
       reason:
-        "teknisi membaca ringkasan biaya WO aktifnya (lihat celah S1); pelanggan wajib ditolak",
+        "teknisi pemegang WO hanya menerima {needs_approval} (S1 ditutup 0016); pelanggan wajib ditolak",
     },
     part_request_create: {
       roles: ["TECHNICIAN"],
@@ -272,6 +349,23 @@ export const RPC_ALLOWED: Record<string, { roles: ("CUSTOMER" | "TECHNICIAN")[];
     part_return_create: {
       roles: ["TECHNICIAN"],
       reason: "teknisi membuat retur untuk WO miliknya",
+    },
+    wo_declare_no_parts: {
+      roles: ["TECHNICIAN"],
+      reason:
+        "teknisi LEAD menyatakan tanpa suku cadang pada WO miliknya (G-13); helper WO002, bukan pemegang WO005",
+    },
+    wo_closure_check: {
+      roles: ["TECHNICIAN"],
+      reason: "pratinjau kekurangan penutupan untuk teknisi pemegang WO dan staf (G-12)",
+    },
+    sync_op_record: {
+      roles: ["TECHNICIAN"],
+      reason: "pemilik baris sync_operations (teknisi) mencatat status operasinya sendiri (G-06)",
+    },
+    sync_rescued_resolve: {
+      roles: [],
+      reason: "hanya staf (ADM, DSP, SPV, OWN); pelanggan dan teknisi wajib WO002 (G-06)",
     },
     log_data_access: {
       roles: ["TECHNICIAN"],
@@ -307,3 +401,44 @@ export const APP_FUNCTIONS_FOR_AUTHENTICATED = [
   "tech_site_ids",
   "wo_storage_prefix",
 ];
+
+/**
+ * Peran staf yang SAH untuk RPC yang tidak diperuntukkan pelanggan/teknisi. Dipakai sebagai kontrol positif:
+ * dengan argumen dummy sah-tipe, peran ini harus MELEWATI penjagaan peran (kode bukan WO002/42501).
+ */
+export const RPC_LEGIT_STAFF: Record<string, string> = {
+  request_decide: "admin",
+  wo_add_helper: "dispatcher",
+  wo_change_priority: "admin",
+  wo_override_billing: "spv",
+  wo_create_rework: "admin",
+  wo_set_estimate: "admin",
+  pm_period_resolve: "admin",
+  part_request_decide: "gudang",
+  part_issue: "gudang",
+  part_return_confirm: "gudang",
+  stock_receive: "gudang",
+  stock_adjust: "gudang",
+  parts_variance_resolve: "spv",
+  admin_set_user_roles: "owner",
+  admin_set_user_active: "admin",
+  sync_rescued_resolve: "admin",
+};
+
+/**
+ * Pengecualian: RPC yang berlingkup-WO/operasi menurut desain dan menjawab WO005 (404 seragam) kepada peran bukan-pemegang
+ * SEBELUM penjagaan peran. Semua RPC lain WAJIB menjawab tepat WO002 kepada peran ini.
+ */
+export const RPC_DENY_WO005: Record<"CUSTOMER" | "TECHNICIAN", string[]> = {
+  CUSTOMER: [
+    "wo_cost_summary",
+    "wo_closure_check",
+    "wo_declare_no_parts",
+    "extra_cost_request",
+    "part_request_create",
+    "part_return_create",
+    "wo_request_help",
+    "sync_op_record",
+  ],
+  TECHNICIAN: ["extra_cost_decide", "wo_customer_sign", "wo_request_cancel"],
+};

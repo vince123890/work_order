@@ -5,7 +5,12 @@
 // nyata dan unggah sah lewat server TIDAK terbukti (lihat handoff).
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type pg from "pg";
-import { APP_FUNCTIONS_FOR_AUTHENTICATED, RPC_ALLOWED } from "./catalog";
+import {
+  APP_FUNCTIONS_FOR_AUTHENTICATED,
+  RPC_ALLOWED,
+  RPC_DENY_WO005,
+  RPC_LEGIT_STAFF,
+} from "./catalog";
 import { ensureFixture, type Fixture, type Kit } from "./fixtures";
 import {
   ANON,
@@ -151,11 +156,30 @@ describe("Storage: can_read_object dan policy storage.objects (T2, T3)", () => {
     expect(await list(F.ids.userB, F.custB)).toEqual(expected(kB));
     expect(await list(F.ids.userA, F.custB)).toEqual([]);
     expect(await list(F.ids.userB, F.custA)).toEqual([]);
-    // kontrol: staf melihat semua 7 objek tiap pelanggan; teknisi hanya WO yang dipegangnya
+    // kontrol: staf melihat semua 7 objek tiap pelanggan; teknisi hanya wo-media WO yang dipegangnya (S4: bukan reports)
     expect((await list(F.ids.admin, F.custA)).length).toBe(7);
     expect((await list(F.ids.admin, F.custB)).length).toBe(7);
-    expect((await list(F.ids.tek1, F.custA)).length).toBe(7);
+    expect((await list(F.ids.tek1, F.custA)).length).toBe(6);
+    expect(await list(F.ids.tek1, F.custA)).not.toContain(`reports:${kA.reportPath}`);
     expect(await list(F.ids.tek2, F.custA)).toEqual([]);
+  });
+
+  it("[S4] teknisi pemegang WO: can_read_object bucket reports = false, wo-media = true; staf dan FINANCE tetap membaca reports", async () => {
+    const t = (bucket: string, path: string) => check(F.ids.tek1, bucket, path);
+    expect((await t("wo-media", kA.attAfter.path)).ok, "kontrol: wo-media WO miliknya").toBe(true);
+    expect((await t("wo-media", kA.attOther.path)).ok, "teknisi boleh OTHER pada WO miliknya").toBe(
+      true,
+    );
+    expect((await t("reports", kA.reportPath)).ok).toBe(false);
+    expect((await t("reports", kA.attAfter.path)).ok).toBe(false);
+    // teknisi lain: tidak ada akses sama sekali
+    expect((await check(F.ids.tek2, "wo-media", kA.attAfter.path)).ok).toBe(false);
+    // kontrol: staf dan FINANCE membaca reports
+    expect((await check(F.ids.admin, "reports", kA.reportPath)).ok).toBe(true);
+    const fin = (
+      await db.query("select id from auth.users where email = $1", ["finance@demo.vasta.test"])
+    ).rows[0].id as string;
+    expect((await check(fin, "reports", kA.reportPath)).ok).toBe(true);
   });
 
   it("pengguna tanpa pemetaan dan pengguna nonaktif tidak membaca objek apa pun", async () => {
@@ -312,18 +336,28 @@ describe("Struktur database (langsung ke Postgres) (T13, T18)", () => {
 });
 
 // ------------------------------------------------------------------------------------------------
-describe("RPC parametrik (T15): turunan dari pg_proc, ditolak untuk pelanggan, teknisi, dan anon", () => {
+describe("RPC parametrik (T15, B1): turunan dari pg_proc; penjagaan peran dibuktikan dengan argumen milik pemanggil", () => {
   let rpcs: RpcInfo[];
   let enums: Record<string, string>;
   const RANDOM = () => crypto.randomUUID();
 
-  function dummy(name: string, type: string): unknown {
+  type Ctx = { wo: string; approval: string; request: string };
+  const randomCtx = (): Ctx => ({ wo: RANDOM(), approval: RANDOM(), request: RANDOM() });
+  // sumber daya MILIK pemanggil sendiri: kepemilikan lolos, jadi hanya penjagaan peran yang membedakan hasilnya.
+  // woProgress dipegang teknisi 1 (LEAD) dan dimiliki pelanggan A; persetujuan dan permintaan juga milik A.
+  const ownCtx = (): Ctx => ({
+    wo: kA.woProgress,
+    approval: kA.approvalId,
+    request: kA.reqSubmitted,
+  });
+
+  function dummy(name: string, type: string, ctx: Ctx): unknown {
     if (type.endsWith("[]")) return [];
     if (type === "uuid") {
-      if (/wo_id|parent_wo/.test(name)) return kB.woClosed;
-      if (/approval/.test(name)) return kB.approvalId;
-      if (/request_id/.test(name)) return kB.reqClosed;
-      return RANDOM(); // user/item/line/lokasi: acak agar tidak mengubah data nyata bila penjagaan bocor
+      if (/wo_id|parent_wo/.test(name)) return ctx.wo;
+      if (/approval/.test(name)) return ctx.approval;
+      if (/^p_request_id$/.test(name)) return ctx.request;
+      return RANDOM(); // user/item/baris/lokasi: acak agar penjagaan yang bocor tidak mengubah data nyata
     }
     if (type === "text")
       return /action/.test(name) ? "ASSIGN" : /decision/.test(name) ? "APPROVE" : "x";
@@ -337,10 +371,10 @@ describe("RPC parametrik (T15): turunan dari pg_proc, ditolak untuk pelanggan, t
     if (type in enums) return enums[type];
     throw new Error(`tipe argumen belum dipetakan: ${name} ${type}`);
   }
-  const argsOf = (f: RpcInfo) => {
+  const argsOf = (f: RpcInfo, ctx: Ctx) => {
     const out: Record<string, unknown> = {};
     for (let i = 0; i < f.required; i++)
-      out[f.argNames[i] as string] = dummy(f.argNames[i] as string, f.argTypes[i] as string);
+      out[f.argNames[i] as string] = dummy(f.argNames[i] as string, f.argTypes[i] as string, ctx);
     return out;
   };
 
@@ -349,41 +383,80 @@ describe("RPC parametrik (T15): turunan dari pg_proc, ditolak untuk pelanggan, t
     enums = await enumFirstLabels();
   });
 
-  it("daftar RPC diturunkan dari DB, cukup lengkap, dan setiap pengecualian terdaftar dengan alasan", () => {
-    expect(rpcs.length).toBeGreaterThan(20);
+  it("daftar RPC diturunkan dari DB, lengkap terklasifikasi, dan setiap pengecualian terdaftar dengan alasan", () => {
+    expect(rpcs.length).toBeGreaterThan(25);
     const names = rpcs.map((r) => r.name);
     for (const k of Object.keys(RPC_ALLOWED)) expect(names, `RPC_ALLOWED ${k}`).toContain(k);
+    for (const k of Object.keys(RPC_LEGIT_STAFF))
+      expect(names, `RPC_LEGIT_STAFF ${k}`).toContain(k);
     for (const k of [
       "wo_transition",
       "request_decide",
       "admin_set_user_roles",
       "stock_adjust",
       "wo_set_estimate",
+      "wo_declare_no_parts",
+      "wo_closure_check",
+      "sync_op_record",
+      "sync_rescued_resolve",
     ])
       expect(names).toContain(k);
     for (const v of Object.values(RPC_ALLOWED)) expect(v.reason.length).toBeGreaterThan(10);
     expect(new Set(names).size, "tidak ada overload ambigu").toBe(names.length);
+    // setiap RPC harus dikenal: sah bagi suatu peran (RPC_ALLOWED) atau khusus staf (RPC_LEGIT_STAFF)
+    const unclassified = names.filter((n) => !(n in RPC_ALLOWED) && !(n in RPC_LEGIT_STAFF));
+    expect(unclassified, "RPC baru belum diklasifikasikan di catalog.ts").toEqual([]);
+    // setiap pengecualian WO005 harus RPC yang ada dan tidak sah bagi peran itu
+    for (const role of ["CUSTOMER", "TECHNICIAN"] as const)
+      for (const n of RPC_DENY_WO005[role]) {
+        expect(names, n).toContain(n);
+        expect(RPC_ALLOWED[n]?.roles.includes(role) ?? false, `${n} sah bagi ${role}`).toBe(false);
+      }
   });
 
   it.each(["CUSTOMER", "TECHNICIAN"] as const)(
-    "setiap RPC yang tidak diizinkan bagi peran %s menolak dengan WO002/WO005/42501 (bukan sukses)",
+    "peran %s: setiap RPC yang tidak sah ditolak dengan kode TEPAT (WO002; WO005 hanya untuk RPC berlingkup-WO yang terdaftar) memakai sumber daya milik sendiri",
     async (role) => {
       const tok = role === "CUSTOMER" ? A : T1;
       const targets = rpcs.filter((f) => !RPC_ALLOWED[f.name]?.roles.includes(role));
       expect(targets.length).toBeGreaterThan(15);
-      const res = await pmap(targets, (f) => rpc(tok, f.name, argsOf(f)), 6);
+      const ctx = ownCtx();
+      const res = await pmap(targets, (f) => rpc(tok, f.name, argsOf(f, ctx)), 6);
       const bad: string[] = [];
       res.forEach((r, i) => {
-        const d = deniedWith(r, ["WO002", "WO005", "42501"]);
-        if (!d.ok) bad.push(`${targets[i]?.name}: ${d.info}`);
+        const name = targets[i]?.name as string;
+        const expected = RPC_DENY_WO005[role].includes(name) ? "WO005" : "WO002";
+        const d = deniedWith(r, [expected]);
+        if (!d.ok) bad.push(`${name}: ${d.info}`);
       });
       expect(bad).toEqual([]);
     },
     180_000,
   );
 
+  it("kontrol peran sah: RPC khusus staf, dipanggil peran stafnya dengan argumen dummy, MELEWATI penjagaan peran (bukan WO002/42501)", async () => {
+    const entries = Object.entries(RPC_LEGIT_STAFF);
+    const res = await pmap(
+      entries,
+      async ([name, who]) => {
+        const f = rpcs.find((x) => x.name === name) as RpcInfo;
+        return rpc(await login(who), name, argsOf(f, randomCtx()));
+      },
+      4,
+    );
+    const bad: string[] = [];
+    res.forEach((r, i) => {
+      const name = entries[i]?.[0];
+      if (r.status >= 500 || r.code === "WO002" || r.code === "42501")
+        bad.push(
+          `${name}: HTTP ${r.status} kode=${String(r.code)} ${JSON.stringify(r.body).slice(0, 200)}`,
+        );
+    });
+    expect(bad).toEqual([]);
+  }, 180_000);
+
   it("anon ditolak untuk SEMUA RPC dengan 42501 (HTTP 401/403)", async () => {
-    const res = await pmap(rpcs, (f) => rpc(null, f.name, argsOf(f)), 6);
+    const res = await pmap(rpcs, (f) => rpc(null, f.name, argsOf(f, randomCtx())), 6);
     const bad: string[] = [];
     res.forEach((r, i) => {
       if (!([401, 403].includes(r.status) && r.code === "42501"))
@@ -393,23 +466,21 @@ describe("RPC parametrik (T15): turunan dari pg_proc, ditolak untuk pelanggan, t
   }, 180_000);
 
   it("RPC sah bagi peran tertentu tetap berfungsi untuk peran itu (kontrol: bukan semuanya ditolak buta)", async () => {
-    // pelanggan: kepemilikan lolos pada WO sendiri (kode bukan WO005)
     const own = await rpc(A, "extra_cost_decide", {
       p_approval_id: kA.approvalId,
       p_decision: "APPROVE",
       p_content_hash: "salah",
     });
     expect(own.code).toBe("WO004");
-    // teknisi: ringkasan biaya WO yang dipegangnya sukses (celah S1 diuji terpisah di isolation.test.ts)
     const cost = await rpc(T1, "wo_cost_summary", { p_wo_id: kA.woAwait });
     expect(cost.status).toBe(200);
-    // teknisi lain ditolak WO005 atas WO yang bukan miliknya
     expectCode(
       await rpc(T2, "wo_cost_summary", { p_wo_id: kA.woAwait }),
       ["WO005"],
       "teknisi lain",
     );
-    // staf memiliki akses
     expect((await rpc(ADM, "wo_cost_summary", { p_wo_id: kA.woAwait })).status).toBe(200);
+    const chk = await rpc(T1, "wo_closure_check", { p_wo_id: kA.woAwait });
+    expect(chk.status, JSON.stringify(chk.body)).toBe(200);
   });
 });

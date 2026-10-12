@@ -11,8 +11,9 @@ import {
   MUST_BE_FORBIDDEN,
   PRICE_COLUMNS,
   TECH_VIEW_COLUMNS,
+  WO_PRICE_BILLING_COLUMNS,
 } from "./catalog";
-import { ensureFixture, type Fixture, type Kit } from "./fixtures";
+import { ensureFixture, resetTransient, type Fixture, type Kit } from "./fixtures";
 import {
   api,
   asRole,
@@ -28,6 +29,7 @@ import {
   rowsStrict,
   rpc,
   trySql,
+  withDb,
   type Res,
 } from "./helpers";
 
@@ -879,28 +881,36 @@ describe("Teknisi (T11, REASSIGN)", () => {
         `select distinct wo_id from public.wo_assignments where technician_id = $1 and status in ${ACTIVE}`,
         [techId],
       );
-      const got = await fetchAll(tok, "work_orders", "id");
+      const got = await fetchAll(tok, "tech_work_orders", "id");
       expect(got.status).toBe(200);
       expect(expected.rows.length, "kontrol: teknisi punya penugasan").toBeGreaterThan(2);
       expect(got.rows.map((r) => r.id).sort()).toEqual(expected.rows.map((r) => r.wo_id).sort());
     }
     // kontrol silang eksplisit
-    const w1 = (await fetchAll(T1, "work_orders", "id")).rows.map((r) => r.id);
-    const w2 = (await fetchAll(T2, "work_orders", "id")).rows.map((r) => r.id);
+    const w1 = (await fetchAll(T1, "tech_work_orders", "id")).rows.map((r) => r.id);
+    const w2 = (await fetchAll(T2, "tech_work_orders", "id")).rows.map((r) => r.id);
     expect(w1).toContain(F.woA);
     expect(w1).not.toContain(F.woB);
     expect(w2).toContain(F.woB);
     expect(w2).not.toContain(F.woA);
+    // sejak 0016 tabel mentah work_orders tertutup bagi teknisi (0 baris), padahal DB berisi WO miliknya
+    for (const tok of [T1, T2]) {
+      const raw = await fetchAll(tok, "work_orders", "id");
+      expect(raw.status).toBeLessThan(500);
+      expect(raw.rows).toHaveLength(0);
+    }
   });
 
   it("teknisi 2 tidak bisa membaca WO teknisi 1 lewat tebakan ID (kontrol: teknisi 1 bisa)", async () => {
     for (const wo of [F.woA, kA.woClosed, kA.woAwait]) {
-      expect(rowsOf(await rest(T1, `work_orders?select=id&id=eq.${wo}`)), `T1 ${wo}`).toHaveLength(
-        1,
-      );
-      expect(rowsOf(await rest(T2, `work_orders?select=id&id=eq.${wo}`)), `T2 ${wo}`).toHaveLength(
-        0,
-      );
+      expect(
+        rowsOf(await rest(T1, `tech_work_orders?select=id&id=eq.${wo}`)),
+        `T1 ${wo}`,
+      ).toHaveLength(1);
+      expect(
+        rowsOf(await rest(T2, `tech_work_orders?select=id&id=eq.${wo}`)),
+        `T2 ${wo}`,
+      ).toHaveLength(0);
     }
   });
 
@@ -919,17 +929,17 @@ describe("Teknisi (T11, REASSIGN)", () => {
         "REASSIGNED tercatat",
       ).toBe(true);
       for (const rel of [
-        "work_orders",
+        "tech_work_orders",
         "wo_assignments",
         "wo_status_history",
         "wo_checklist_items",
       ]) {
-        const col = rel === "work_orders" ? "id" : "wo_id";
+        const col = rel === "tech_work_orders" ? "id" : "wo_id";
         const rOld = await rest(oldTok(), `${rel}?select=*&${col}=eq.${wo()}`);
         expect(rowsOf(rOld), `${rel} oleh teknisi lama`).toHaveLength(0);
       }
       expect(
-        rowsOf(await rest(newTok(), `work_orders?select=id&id=eq.${wo()}`)),
+        rowsOf(await rest(newTok(), `tech_work_orders?select=id&id=eq.${wo()}`)),
         "teknisi baru",
       ).toHaveLength(1);
       expect(
@@ -953,6 +963,7 @@ describe("Teknisi (T11, REASSIGN)", () => {
   });
 
   it.each([
+    "tech_work_orders",
     "tech_wo_part_usages",
     "tech_wo_labor_lines",
     "tech_extra_cost_approvals",
@@ -979,52 +990,123 @@ describe("Teknisi (T11, REASSIGN)", () => {
 });
 
 // ------------------------------------------------------------------------------------------------
-describe("Celah SQL terkonfirmasi (dua uji tiap celah: celah ADA + perilaku benar)", () => {
+describe("Perbaikan 0016: G-08, S1, S2 (celah lama kini ditutup; uji biasa, bukan it.fails)", () => {
   // ---- G-08
-  it("[celah diketahui G-08] KONTROL: teknisi memang membaca estimate_total dan billing_* dari work_orders", async () => {
-    const rows = rowsStrict(await rest(T1, `work_orders?select=*&id=eq.${kA.woAwait}`), "G-08");
-    expect(rows).toHaveLength(1);
-    const row = rows[0] as Record<string, unknown>;
-    expect(row.estimate_total).toBe(1500000);
-    expect(row.billing_type).toBe("BILLABLE");
-    expect(Object.keys(row)).toEqual(
-      expect.arrayContaining(["estimate_total", "billing_type", "billing_status"]),
+  it("[G-08] teknisi 0 baris di tabel mentah work_orders, padahal DB berisi WO miliknya (kontrol)", async () => {
+    const ctl = await db.query(
+      "select count(*)::int n from public.wo_assignments where technician_id = $1 and wo_id = $2",
+      [F.tech1, kA.woAwait],
+    );
+    expect(ctl.rows[0].n, "kontrol: T1 memegang woAwait").toBeGreaterThan(0);
+    const r = await rest(T1, `work_orders?select=*&id=eq.${kA.woAwait}`);
+    expect(r.status).toBeLessThan(500);
+    expect(rowsOf(r)).toHaveLength(0);
+    // staf tetap membaca (kontrol bahwa baris itu ada dan jalur baca bekerja)
+    const adm = rowsStrict(
+      await rest(ADM, `work_orders?select=id,estimate_total&id=eq.${kA.woAwait}`),
+      "ADM",
+    );
+    expect(adm).toHaveLength(1);
+    expect(adm[0]?.estimate_total).toBe(1500000);
+  });
+
+  it("[G-08] teknisi membaca WO-nya lewat tech_work_orders tanpa kolom estimate_*, billing_*, warranty_exception_reason", async () => {
+    const rows = rowsStrict(
+      await rest(T1, `tech_work_orders?select=*&id=eq.${kA.woAwait}`),
+      "G-08",
+    );
+    expect(rows).toHaveLength(1); // kontrol positif: pemegang melihat WO-nya
+    const cols = Object.keys(rows[0] as object);
+    for (const c of WO_PRICE_BILLING_COLUMNS) expect(cols, `kolom ${c}`).not.toContain(c);
+    expect(cols).toEqual(
+      expect.arrayContaining(["id", "status", "version", "children_changed_at"]),
+    );
+    // permintaan eksplisit kolom harga ditolak (bukan sekadar disembunyikan oleh select=*)
+    const explicit = await rest(T1, `tech_work_orders?select=estimate_total&id=eq.${kA.woAwait}`);
+    expect(explicit.status).toBeGreaterThanOrEqual(400);
+    expect(explicit.status).toBeLessThan(500);
+    // teknisi lain (bukan pemegang) tidak melihat WO itu
+    expect(rowsOf(await rest(T2, `tech_work_orders?select=id&id=eq.${kA.woAwait}`))).toHaveLength(
+      0,
     );
   });
 
-  it.fails(
-    "[celah diketahui G-08] perilaku benar: teknisi tidak melihat kolom harga di work_orders (AP-2)",
-    async () => {
-      const rows = rowsStrict(await rest(T1, `work_orders?select=*&id=eq.${kA.woAwait}`), "G-08");
-      expect(rows).toHaveLength(1);
-      const cols = Object.keys(rows[0] as object);
-      for (const c of ["estimate_total", "billing_type", "billing_status"])
-        expect(cols, `kolom ${c} terlihat oleh teknisi`).not.toContain(c);
-    },
-  );
-
   // ---- S1
-  it("[celah diketahui S1] KONTROL: wo_cost_summary memberi estimate_total dan projected_total ke teknisi", async () => {
-    const r = await rpc<Record<string, unknown>>(T1, "wo_cost_summary", { p_wo_id: kA.woAwait });
-    expect(r.status, JSON.stringify(r.body)).toBe(200);
-    expect(r.body.estimate_total).toBe(1500000);
-    expect(r.body.projected_total).toBe(650000);
+  it("[S1] wo_cost_summary: teknisi pemegang hanya menerima {needs_approval}; staf menerima hasil penuh", async () => {
+    const t = await rpc<Record<string, unknown>>(T1, "wo_cost_summary", { p_wo_id: kA.woAwait });
+    expect(t.status, JSON.stringify(t.body)).toBe(200);
+    expect(Object.keys(t.body).sort()).toEqual(["needs_approval"]);
+    expect(typeof t.body.needs_approval).toBe("boolean");
+    const s = await rpc<Record<string, unknown>>(ADM, "wo_cost_summary", { p_wo_id: kA.woAwait });
+    expect(s.status).toBe(200);
+    expect(Object.keys(s.body).sort()).toEqual(
+      ["estimate_total", "needs_approval", "projected_total", "tolerance"].sort(),
+    );
+    expect(s.body.estimate_total).toBe(1500000);
+    expect(s.body.projected_total).toBe(650000);
+    // teknisi bukan pemegang: WO005 seragam
+    expectCode(
+      await rpc(T2, "wo_cost_summary", { p_wo_id: kA.woAwait }),
+      ["WO005"],
+      "bukan pemegang",
+    );
   });
 
-  it.fails(
-    "[celah diketahui S1] perilaku benar: teknisi tidak menerima nilai harga dari wo_cost_summary",
-    async () => {
-      const r = await rpc<Record<string, unknown>>(T1, "wo_cost_summary", { p_wo_id: kA.woAwait });
-      // pra-syarat agar uji tidak lulus karena galat: panggilan harus sukses atau ditolak jelas
-      expect([200, 400, 403]).toContain(r.status);
-      const keys = Object.keys(r.body ?? {});
-      expect(keys).not.toContain("estimate_total");
-      expect(keys).not.toContain("projected_total");
-    },
-  );
+  it("[S1] wo_cost_summary(NULL) memberi WO005 seragam (identik dengan id acak) bagi pelanggan, teknisi, dan staf", async () => {
+    for (const [nama, tok] of [
+      ["pelanggan", A],
+      ["teknisi", T1],
+      ["staf", ADM],
+    ] as const) {
+      const nul = await rpc(tok, "wo_cost_summary", { p_wo_id: null });
+      const rnd = await rpc(tok, "wo_cost_summary", { p_wo_id: crypto.randomUUID() });
+      expectCode(nul, ["WO005"], nama);
+      expect(errShape(nul), nama).toEqual(errShape(rnd));
+    }
+  });
 
-  // ---- S2
-  it("[celah S2 - TIDAK TEREPRODUKSI] KONTROL: pembayaran invoice DRAFT ada di DB dan invoice DRAFT tidak terlihat pelanggan", async () => {
+  // ---- residu G-08: extra_cost_request tidak mengembalikan total
+  it("[G-08] extra_cost_request: nilai kembalian teknisi tanpa kunci 'total' (data dipulihkan setelahnya)", async () => {
+    const before = await db.query("select version, status from public.work_orders where id = $1", [
+      kA.woProgress,
+    ]);
+    expect(before.rows[0].status, "pra-syarat: woProgress IN_PROGRESS").toBe("IN_PROGRESS");
+    try {
+      const r = await rpc<Record<string, unknown>>(T1, "extra_cost_request", {
+        p_wo_id: kA.woProgress,
+        p_reason: "[UJI ISOLASI] biaya tambahan uji",
+        p_items: [
+          { kind: "OTHER", description: "[UJI ISOLASI] komponen", qty: 1, unit_price: 12345 },
+        ],
+        p_expected_version: before.rows[0].version,
+      });
+      expect(r.status, JSON.stringify(r.body)).toBe(200);
+      const keys = Object.keys(r.body);
+      expect(keys).not.toContain("total");
+      expect(keys).toEqual(
+        expect.arrayContaining(["approval_id", "content_hash", "approval_version"]),
+      );
+      // kontrol: total memang tersimpan di DB, tetapi view teknisi tidak memuatnya
+      const row = await db.query("select total from public.extra_cost_approvals where id = $1", [
+        r.body.approval_id,
+      ]);
+      expect(Number(row.rows[0].total)).toBe(12345);
+      const tv = rowsStrict(
+        await rest(
+          T1,
+          `tech_extra_cost_approvals?select=*&approval_id=eq.${String(r.body.approval_id)}`,
+        ),
+        "tech view",
+      );
+      expect(tv).toHaveLength(1);
+      expect(Object.keys(tv[0] as object)).not.toContain("total");
+    } finally {
+      await withDb((d) => resetTransient(d, [kA]));
+    }
+  });
+
+  // ---- S2 (regresi): filter status eksplisit
+  it("[S2 regresi] KONTROL: pembayaran invoice DRAFT ada di DB dan invoice DRAFT tidak terlihat pelanggan", async () => {
     const p = await db.query(
       "select p.id, i.status from public.payments p join public.invoices i on i.id = p.invoice_id where p.id = any($1)",
       [[kA.payDraft, kA.payIssued]],
@@ -1040,9 +1122,7 @@ describe("Celah SQL terkonfirmasi (dua uji tiap celah: celah ADA + perilaku bena
     expect(inv.map((r) => r.id)).not.toContain(kA.invDraft);
   });
 
-  it("[celah S2 - TIDAK TEREPRODUKSI] perilaku benar: pelanggan tidak melihat pembayaran dari invoice DRAFT (subquery policy tetap tunduk pada RLS invoices)", async () => {
-    // Dilaporkan terkonfirmasi sebagai S1/S2, tetapi pada Supabase nyata policy payments_customer
-    // membaca invoices melalui RLS pemanggil (invoices_customer memfilter ISSUED/PAID), sehingga tidak bocor.
+  it("[S2 regresi] pelanggan tidak melihat pembayaran/baris invoice dari invoice DRAFT; policy payments_customer memfilter status secara eksplisit", async () => {
     const pays = rowsStrict(await rest(A, "payments?select=id,invoice_id"), "payments");
     expect(pays.map((r) => r.id)).toContain(kA.payIssued); // kontrol positif
     expect(pays.map((r) => r.id)).not.toContain(kA.payDraft);
@@ -1050,6 +1130,13 @@ describe("Celah SQL terkonfirmasi (dua uji tiap celah: celah ADA + perilaku bena
     const lines = rowsStrict(await rest(A, "invoice_lines?select=invoice_id"), "invoice_lines");
     expect(lines.length).toBeGreaterThan(0);
     expect(lines.map((r) => r.invoice_id)).not.toContain(kA.invDraft);
+    // regresi teks policy: filter status ada di payments_customer itu sendiri (bukan hanya lewat RLS invoices)
+    const pol = await db.query(
+      "select qual from pg_policies where schemaname = 'public' and tablename = 'payments' and policyname = 'payments_customer'",
+    );
+    expect(pol.rows).toHaveLength(1);
+    expect(String(pol.rows[0].qual)).toMatch(/ISSUED/);
+    expect(String(pol.rows[0].qual)).toMatch(/PAID/);
   });
 });
 
@@ -1242,7 +1329,6 @@ describe("Penonaktifan akun (T16)", () => {
       if (r.status >= 500) leaks.push(`${n}: HTTP ${r.status}`);
       const own = ALLOWED_TABLES[n]?.own;
       if (own?.kind === "user" || own?.kind === "katalog") return; // baris milik diri sendiri / katalog umum
-      if (n === "customer_users") return; // dinilai terpisah pada uji [temuan N1] di bawah
       if (r.rows.length > 0) leaks.push(`${n}: ${r.rows.length} baris`);
     });
     expect(leaks).toEqual([]);
@@ -1254,10 +1340,8 @@ describe("Penonaktifan akun (T16)", () => {
     // akun dibiarkan nonaktif (akun uji khusus, tercatat di handoff)
   }, 300_000);
 
-  // TEMUAN BARU N1 (rendah): policy customer_users_select memakai user_id = auth.uid() tanpa memeriksa profiles.is_active,
-  // sehingga akun nonaktif masih membaca baris pemetaan pelanggannya sendiri (05 bagian 2 menyatakan himpunan kosong).
-  // Uji ini sengaja DIBIARKAN GAGAL (tidak dilonggarkan) sampai policy diperbaiki.
-  it("[temuan N1] pengguna nonaktif tidak membaca baris customer_users miliknya sendiri", async () => {
+  // N1 (ditutup 0016): customer_users_select kini mensyaratkan customer_users.is_active dan profiles.is_active.
+  it("[N1] pengguna nonaktif tidak membaca baris customer_users miliknya sendiri", async () => {
     const tok = await login(F.emails.nonaktif);
     await setActive(false);
     const r = await rest(tok, "customer_users?select=customer_id,user_id");
