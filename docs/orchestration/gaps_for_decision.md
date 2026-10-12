@@ -29,3 +29,18 @@ G-07 (`run_job` ada di schema `app`, tidak terekspos), G-09 (penyesuaian stok du
 2. Setujui satu **migrasi tambahan 0016** (aditif, tanpa menghapus apa pun) yang menutup G-04, G-05, G-06, G-08, G-12 (hanya `wo_closure_check`), G-13? Ini mengubah skema 04 yang sudah ada di Supabase, sehingga butuh persetujuan (CP-04) dan harus ditulis ulang juga di `docs/04_database_schema.sql`/05.
 3. **G-02**: terima batas laju per pelanggan saja?
 4. **G-06**: apakah `service_role` boleh dipakai oleh `/sync/push` untuk mencatat status operasi (menambah daftar tertutup 05 bagian 6.3), atau lebih baik RPC `sync_op_record`? Saran: RPC, supaya `service_role` tidak melebar.
+
+## Temuan keamanan baru dari review WP-007 (menambah isi migrasi 0016)
+Sumber: `docs/orchestration/reviews/WP-007_review_v1.md` dan uji nyata WP-007. S1 terbukti oleh uji di Supabase nyata; S2 dicabut (lihat baris S2); N1 baru dari PJ WP-007.
+
+| ID | Temuan | Lokasi | Usulan perbaikan |
+|---|---|---|---|
+| ~~S2~~ | **DICABUT sebagai bug eksploitabel (menunggu konfirmasi review v2).** Dugaan awal: pelanggan melihat pembayaran invoice DRAFT. Uji di Supabase nyata (WP-007) menunjukkan tidak terjadi: subquery policy `payments_customer` membaca `invoices` dengan RLS pemanggil, sehingga filter `ISSUED/PAID` ikut berlaku. Verifikasi awal orchestrator hanya membaca teks policy, bukan menjalankannya. Tetap disarankan menambah filter status eksplisit sebagai pertahanan berlapis | `0013:461-462` | Opsional: tambah `and i.status in ('ISSUED','PAID')` |
+| **S1** | `wo_cost_summary` dapat dipanggil teknisi pada WO aktifnya dan mengembalikan `estimate_total` dan `projected_total` (bocor harga ke teknisi; belum tercatat di G-08) | `0010:902-916` | Batasi hasil untuk teknisi ke `needs_approval` saja |
+| S4 | `can_read_object`: cabang `req` tidak memeriksa nama bucket; teknisi bisa membaca bucket `reports` untuk WO aktifnya | `0013:44-56` | Periksa bucket per cabang |
+| S6 | ADMIN_CS bebas memberi peran SUPERVISOR/FINANCE/WAREHOUSE/TECHNICIAN (termasuk ke dirinya sendiri) | `0013:67-85` | Keputusan: sesuai D22 atau dibatasi? |
+| S9 | Pelanggan membaca `customers.auto_approve` (kontrol internal) | `0003:69` | View terbatas atau cabut kolom |
+
+| N1 | Akun nonaktif (`is_active=false`) masih membaca baris `customer_users` miliknya sendiri; policy `customer_users_select` memakai `user_id = auth.uid()` tanpa memeriksa `profiles.is_active` (risiko rendah: relasi data pelanggan lain kosong untuk akun nonaktif). Ditemukan uji nyata WP-007 | `0013` policy `customer_users_select` | Tambah pemeriksaan `is_active` |
+
+Status: belum diperbaiki. Perbaikan butuh persetujuan migrasi `0016` (lihat pertanyaan 2 di atas).
